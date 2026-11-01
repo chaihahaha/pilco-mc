@@ -51,6 +51,8 @@ class CartPole:
 
     state_dim: int = 4
     control_dim: int = 1
+    #: coordinates that are angles; the policy gets their sin/cos as features
+    angle_indices: tuple = (3,)
 
     # ------------------------------------------------------------------
     #: ``"swingup"`` starts hanging (``theta = 0``), ``"balance"`` starts near

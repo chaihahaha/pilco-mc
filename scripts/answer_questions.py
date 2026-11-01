@@ -72,7 +72,7 @@ class OracleDynamics(torch.nn.Module):
         self.dt, self.substeps = dt, substeps
         self.process_noise = process_noise
 
-    def step(self, x, u, generator=None, member=None):
+    def step(self, x, u, generator=None, member=None, noise=None):
         h = self.dt / self.substeps
         u = u.reshape(x.shape[:-1])            # (P,) force, not (P, 1)
         z = x
@@ -83,7 +83,8 @@ class OracleDynamics(torch.nn.Module):
             k4 = cartpole_rhs(z + h * k3, u)
             z = z + h / 6.0 * (k1 + 2 * k2 + 2 * k3 + k4)
         var = torch.full_like(z, self.process_noise ** 2)
-        noise = torch.randn(z.shape, dtype=z.dtype, generator=generator)
+        if noise is None:
+            noise = torch.randn(z.shape, dtype=z.dtype, generator=generator)
         return z + self.process_noise * noise, var
 
     def sample_next(self, x, u, generator=None, member=None):

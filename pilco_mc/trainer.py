@@ -24,9 +24,9 @@ from typing import Callable, Optional
 import numpy as np
 import torch
 
-from .nn import BoundedPolicy, DynamicsEnsemble
+from .nn import BoundedPolicy, DynamicsEnsemble, RbfPolicy
 from .objective import cost_statistics, expected_cost
-from .particles import initial_particles, rollout
+from .particles import draw_batch, initial_particles, rollout, rollout_batch
 
 __all__ = ["MCConfig", "EpisodeLog", "fit_model", "optimise_policy", "learn"]
 
@@ -55,7 +55,24 @@ class MCConfig:
     validation_fraction: float = 0.15
 
     # -- policy -----------------------------------------------------------
-    policy_steps: int = 250
+    #: ``"rbf"`` (PILCO's controller, few parameters) or ``"mlp"``
+    policy_kind: str = "rbf"
+    n_basis: int = 12
+    #: optimisation rounds; each round re-draws the particle batch and runs an
+    #: L-BFGS line search on the (now deterministic) objective
+    policy_rounds: int = 8
+    lbfgs_max_iter: int = 20
+    #: ``"cem"`` = cross-entropy search then an LBFGS polish (default),
+    #: ``"lbfgs"`` = LBFGS only.  Gradient search from a random initialisation
+    #: reliably lands in a local minimum around 31-35 on cart-pole even with a
+    #: perfect model; the population search finds the basin first.
+    policy_optimizer: str = "cem"
+    cem_iters: int = 30
+    cem_population: int = 48
+    cem_elite: int = 8
+    cem_sigma: float = 0.3
+    cem_sigma_floor: float = 0.02
+    policy_steps: int = 250          # kept for the Adam fallback
     policy_lr: float = 3e-3
     #: particles per Monte Carlo estimate; the estimator's standard error is
     #: ``O(1/sqrt(particles))``
@@ -67,6 +84,8 @@ class MCConfig:
     #: :func:`pilco_mc.objective.expected_cost`.
     uncertainty_weight: float = 0.2
     gamma: float = 1.0
+    #: stop the policy search early once the predicted cost is this low
+    stop_cost: float = 0.0
 
     verbose: bool = True
 
@@ -143,52 +162,132 @@ def fit_model(states: torch.Tensor, controls: torch.Tensor, deltas: torch.Tensor
 # ---------------------------------------------------------------------------
 # policy optimisation inside the model
 # ---------------------------------------------------------------------------
-def optimise_policy(model: DynamicsEnsemble, policy: BoundedPolicy,
+def _flatten(params: list[torch.Tensor]) -> torch.Tensor:
+    return torch.cat([p.detach().reshape(-1) for p in params])
+
+
+def _assign(params: list[torch.Tensor], vector: torch.Tensor) -> None:
+    offset = 0
+    with torch.no_grad():
+        for p in params:
+            n = p.numel()
+            p.copy_(vector[offset:offset + n].reshape(p.shape))
+            offset += n
+
+
+def cross_entropy_search(policy, model, cost_fn, mean0, cov0,
+                         config: MCConfig, generator: torch.Generator
+                         ) -> float:
+    """Population search over the policy parameters (CEM / CMA-lite).
+
+    Derivative-free, so it does not care that the objective is only a Monte
+    Carlo estimate, and it explores several basins before committing.  On this
+    task a gradient method from a random start reliably stops at a local minimum
+    worth ~31-35 while a good swing-up is worth ~13, so the basin has to be
+    found before the gradient can be used.
+    """
+    params = list(policy.parameters())
+    mu = _flatten(params)
+    sigma = torch.full_like(mu, config.cem_sigma)
+    batch = draw_batch(mean0, cov0, config.particles, config.horizon,
+                       len(model.members), generator)
+    best, best_state = float("inf"), copy.deepcopy(policy.state_dict())
+    for _ in range(config.cem_iters):
+        noise = torch.randn(config.cem_population, mu.numel(), generator=generator)
+        candidates = mu + sigma * noise
+        scores = []
+        with torch.no_grad():
+            for i in range(config.cem_population):
+                _assign(params, candidates[i])
+                scores.append(float(expected_cost(
+                    rollout_batch(policy, model, batch), cost_fn,
+                    config.gamma, 0.0, None, config.uncertainty_weight)))
+        scores_t = torch.as_tensor(scores)
+        elite = torch.argsort(scores_t)[:config.cem_elite]
+        mu = candidates[elite].mean(0)
+        sigma = candidates[elite].std(0).clamp(min=config.cem_sigma_floor)
+        if float(scores_t[elite[0]]) < best:
+            best = float(scores_t[elite[0]])
+            _assign(params, candidates[elite[0]])
+            best_state = copy.deepcopy(policy.state_dict())
+    policy.load_state_dict(best_state)
+    return best
+
+
+def optimise_policy(model: DynamicsEnsemble, policy,
                     cost_fn: Callable[[torch.Tensor], torch.Tensor],
                     mean0: torch.Tensor, cov0: torch.Tensor,
                     config: MCConfig, generator: torch.Generator
                     ) -> tuple[float, float]:
     """Minimise the Monte Carlo estimate of the expected cost (in place).
 
-    Returns ``(best_cost, standard_error)``.  The policy returned is the **best
-    one seen**, not the last one: the particle estimate is noisy, so the last
-    iterate is not necessarily the best, and keeping it protects against a late
-    excursion into a region where the model is wrong.
+    Two changes make this strong enough to find a swing-up, and both come from
+    the measurement that a perfect model still failed with Adam:
+
+    * the particle batch (initial states, ensemble members, noise) is **fixed
+      within a round**, so the objective is a deterministic function of the
+      policy parameters and its gradient is exact for that batch;
+    * the optimiser is therefore **L-BFGS with a strong-Wolfe line search**, not
+      a fixed-step first-order method.
+
+    The batch is re-drawn between rounds so the policy cannot overfit one draw,
+    and each round's result is scored on a held-out batch, so the policy
+    returned is the best one seen rather than the last one.
     """
+    if config.policy_optimizer == "cem":
+        cross_entropy_search(policy, model, cost_fn, mean0, cov0, config,
+                             generator)
+
     params = list(policy.parameters())
-    optimiser = torch.optim.Adam(params, lr=config.policy_lr)
-    best = float("inf")
+    optimiser = torch.optim.LBFGS(params, lr=1.0,
+                                  max_iter=config.lbfgs_max_iter,
+                                  tolerance_grad=1e-9, tolerance_change=1e-12,
+                                  history_size=20,
+                                  line_search_fn="strong_wolfe")
+    #: fixed batch used to compare rounds -- a fresh draw every round would make
+    #: the comparison noise-dominated
+    val_batch = draw_batch(mean0, cov0, config.particles, config.horizon,
+                           len(model.members), generator)
+
+    best_score = float("inf")
     best_state = copy.deepcopy(policy.state_dict())
-    best_se = float("nan")
-    for step in range(config.policy_steps):
-        for group in optimiser.param_groups:
-            group["lr"] = config.policy_lr * (1.0 - 0.9 * step / config.policy_steps)
-        particles = initial_particles(mean0, cov0, config.particles, generator)
-        members = torch.randint(len(model.members), (config.particles,),
-                                generator=generator)
-        roll = rollout(policy, model, particles, config.horizon, generator, members)
-        loss = expected_cost(roll, cost_fn, config.gamma, config.dropout, generator,
-                             config.uncertainty_weight)
-        # Snapshot *before* the update: ``loss`` describes the current parameters,
-        # so the state matching it is the one before ``optimiser.step()``.  Saving
-        # after the step stores a policy the recorded cost does not describe, and
-        # the "best seen" bookkeeping then silently returns a worse controller
-        # (measured: recorded 37.6, returned 39.99).
-        if float(loss) < best:
-            best = float(loss)
+
+    for _ in range(config.policy_rounds):
+        batch = draw_batch(mean0, cov0, config.particles, config.horizon,
+                           len(model.members), generator)
+
+        def closure():
+            optimiser.zero_grad()
+            roll = rollout_batch(policy, model, batch)
+            # No dropout here: a fresh dropout mask per evaluation would make the
+            # objective random again, which is exactly what the fixed batch is
+            # there to avoid.  Re-drawing the batch between rounds already does
+            # the regularising job dropout was doing.
+            loss = expected_cost(roll, cost_fn, config.gamma, 0.0,
+                                 None, config.uncertainty_weight)
+            loss.backward()
+            for p in params:
+                if p.grad is not None and not p.grad.is_contiguous():
+                    p.grad = p.grad.contiguous()
+            return loss
+
+        optimiser.step(closure)
+
+        with torch.no_grad():
+            score = float(expected_cost(rollout_batch(policy, model, val_batch),
+                                        cost_fn, config.gamma, 0.0, None,
+                                        config.uncertainty_weight))
+        if score < best_score:
+            best_score = score
             best_state = copy.deepcopy(policy.state_dict())
-        optimiser.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(params, 5.0)
-        optimiser.step()
+        if best_score < config.stop_cost:
+            break
+
     policy.load_state_dict(best_state)
     with torch.no_grad():
-        particles = initial_particles(mean0, cov0, config.particles, generator)
-        members = torch.randint(len(model.members), (config.particles,),
-                                generator=generator)
-        roll = rollout(policy, model, particles, config.horizon, generator, members)
-        best, best_se = cost_statistics(roll, cost_fn, config.gamma)
-    return best, best_se
+        roll = rollout_batch(policy, model, val_batch)
+        value, stderr = cost_statistics(roll, cost_fn, config.gamma)
+    return value, stderr
 
 
 # ---------------------------------------------------------------------------
@@ -226,8 +325,14 @@ def learn(scenario, config: Optional[MCConfig] = None,
         controls_all.append(j)
         deltas_all.append(k)
 
-    policy = BoundedPolicy(scenario.state_dim, scenario.control_dim,
-                           [scenario.u_max])
+    if config.policy_kind == "rbf":
+        policy = RbfPolicy(scenario.state_dim, scenario.control_dim,
+                           [scenario.u_max], config.n_basis, generator,
+                           angle_indices=scenario.angle_indices)
+    else:
+        policy = BoundedPolicy(scenario.state_dim, scenario.control_dim,
+                               [scenario.u_max],
+                               angle_indices=scenario.angle_indices)
     logs: list[EpisodeLog] = []
     model = None
 

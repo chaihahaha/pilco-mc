@@ -29,7 +29,8 @@ from typing import Optional, Sequence
 import torch
 import torch.nn as nn
 
-__all__ = ["ResidualMLP", "GaussianHead", "DynamicsEnsemble", "BoundedPolicy"]
+__all__ = ["ResidualMLP", "GaussianHead", "DynamicsEnsemble",
+           "BoundedPolicy", "RbfPolicy"]
 
 DTYPE = torch.float64
 
@@ -199,7 +200,8 @@ class DynamicsEnsemble(nn.Module):
 
     def step(self, x: torch.Tensor, u: torch.Tensor,
              generator: Optional[torch.Generator] = None,
-             member: Optional[torch.Tensor] = None
+             member: Optional[torch.Tensor] = None,
+             noise: Optional[torch.Tensor] = None
              ) -> tuple[torch.Tensor, torch.Tensor]:
         """One reparameterised draw of ``x_{t+1}``, plus the variance it used.
 
@@ -228,7 +230,8 @@ class DynamicsEnsemble(nn.Module):
             mean[sel] = self.y_mu + self.y_sd * mk
             var[sel] = (self.y_sd ** 2) * logvk.exp()
         var = var.clamp(min=1e-12)
-        noise = torch.randn(mean.shape, dtype=x.dtype, generator=generator)
+        if noise is None:
+            noise = torch.randn(mean.shape, dtype=x.dtype, generator=generator)
         return x + mean + var.sqrt() * noise, var
 
     def sample_next(self, x: torch.Tensor, u: torch.Tensor,
@@ -241,6 +244,60 @@ class DynamicsEnsemble(nn.Module):
 # ---------------------------------------------------------------------------
 # policy
 # ---------------------------------------------------------------------------
+def _augment(x: torch.Tensor, angle_indices) -> torch.Tensor:
+    """Append ``sin``/``cos`` of the angle coordinates.
+
+    PILCO's controller reads ``[x, dx, dtheta, sin(theta), cos(theta)]``, and the
+    trig features matter: without them the controller has to represent a periodic
+    function of ``theta`` with a kernel on the real line.  The dynamics network
+    does not need them (it can learn them), but the policy does.
+    """
+    if not angle_indices:
+        return x
+    # PILCO replaces the angle by its sin/cos (`policy_indices` in the MATLAB
+    # code drops `theta`); a kernel on the real line is a poor way to represent a
+    # periodic function, and keeping both would just add a redundant feature.
+    keep = [i for i in range(x.shape[1]) if i not in set(angle_indices)]
+    extras = [f(x[:, a]) for a in angle_indices for f in (torch.sin, torch.cos)]
+    return torch.cat([x[:, keep]] + [e[:, None] for e in extras], dim=-1)
+
+
+class RbfPolicy(nn.Module):
+    """PILCO's controller: ``u = u_max * tanh(sum_i w_i k(x, c_i))``.
+
+    A *linear* model in squared-exponential features.  PILCO used exactly this,
+    and the reason is worth keeping in mind: the policy search optimises over
+    ``n_basis * (n_in + 1) + n_in`` parameters instead of thousands, and the
+    cost is far better conditioned in that space.  The MLP is available too
+    (:class:`BoundedPolicy`), but this is the one that optimises reliably.
+    """
+
+    def __init__(self, state_dim: int, control_dim: int,
+                 u_max: Sequence[float], n_basis: int = 12,
+                 generator: Optional[torch.Generator] = None,
+                 angle_indices: Sequence[int] = ()):
+        super().__init__()
+        self.angle_indices = tuple(angle_indices)
+        n_in = state_dim + len(self.angle_indices)     # angle -> sin, cos
+        self.centers = nn.Parameter(0.5 * torch.randn(n_basis, n_in,
+                                                      dtype=DTYPE, generator=generator))
+        self.log_lengthscales = nn.Parameter(torch.zeros(n_in, dtype=DTYPE))
+        #: The scale of the initial weights decides whether the policy search
+        #: starts on the "do nothing" plateau: with u(x0) ~ 0.3 N the cost is
+        #: flat at 1.0 per step and the gradient vanishes (measured: LBFGS does
+        #: not move at all).  ~5 N, the scale PILCO's random controller happens
+        #: to produce, is enough to see the swing-up.
+        self.weights = nn.Parameter(0.45 * torch.randn(n_basis, control_dim,
+                                                       dtype=DTYPE, generator=generator))
+        self.register_buffer("u_max", torch.as_tensor(list(u_max), dtype=DTYPE))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = _augment(x, self.angle_indices)
+        inv_ell2 = torch.exp(-2.0 * self.log_lengthscales)      # 1 / ell^2
+        d2 = ((x[:, None, :] - self.centers[None]) ** 2 * inv_ell2).sum(-1)
+        return self.u_max * torch.tanh(torch.exp(-0.5 * d2) @ self.weights)
+
+
 class BoundedPolicy(nn.Module):
     """``u = u_max * tanh(MLP(x))``: a residual MLP with a bounded output.
 
@@ -250,10 +307,13 @@ class BoundedPolicy(nn.Module):
     """
 
     def __init__(self, state_dim: int, control_dim: int, u_max: Sequence[float],
-                 width: int = 64, blocks: int = 2):
+                 width: int = 64, blocks: int = 2,
+                 angle_indices: Sequence[int] = ()):
         super().__init__()
-        self.net = ResidualMLP(state_dim, control_dim, width, blocks)
+        self.angle_indices = tuple(angle_indices)
+        self.net = ResidualMLP(state_dim + len(self.angle_indices),
+                               control_dim, width, blocks)
         self.register_buffer("u_max", torch.as_tensor(list(u_max), dtype=DTYPE))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.u_max * torch.tanh(self.net(x))
+        return self.u_max * torch.tanh(self.net(_augment(x, self.angle_indices)))

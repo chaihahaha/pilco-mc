@@ -11,9 +11,13 @@ because every stage is an ARD squared-exponential kernel.  Once the moments are
 estimated from samples, nothing has to be integrable, so the model and the
 controller can be arbitrary differentiable functions.
 
-**Status: the estimator is validated, the loop runs, the cart-pole swing-up is
-not yet learned — and the reason is measured, not guessed.**  See
-[What happens on cart-pole](#what-happens-on-cart-pole).
+**Status: the estimator is validated and the machinery is correct (a
+known-good controller scores 13.4 in this package's own rollout), but the loop
+still does not learn the swing-up.**  Two rounds of "fix what is broken" closed
+five real defects — best single-optimisation result went from 40 to 27 — yet the
+closed loop still sits at ~39.  The remaining gap is the policy-search landscape,
+not the estimator and not the model class.  Details and the next three steps are
+in [docs/NOTES.md](docs/NOTES.md).
 
 ---
 

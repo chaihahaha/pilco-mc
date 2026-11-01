@@ -50,7 +50,8 @@ import torch
 
 from .nn import BoundedPolicy, DynamicsEnsemble
 
-__all__ = ["Rollout", "initial_particles", "rollout", "moment_match"]
+__all__ = ["Rollout", "ParticleBatch", "initial_particles", "draw_batch",
+           "rollout", "rollout_batch", "moment_match"]
 
 
 @dataclass
@@ -151,3 +152,59 @@ def moment_match(roll: Rollout) -> tuple[torch.Tensor, torch.Tensor]:
     from the particles.
     """
     return roll.mean(), roll.cov()
+
+
+@dataclass
+class ParticleBatch:
+    """A **fixed** set of particles, ensemble members and noise draws.
+
+    The Monte Carlo objective is only a function of the policy parameters if the
+    randomness is held fixed.  Resampling the particles at every optimisation
+    step turns the objective into a noisy sequence, and a line search cannot
+    compare two points of a noisy function -- which is why the first version of
+    this project could only use Adam, and why it could not optimise hard enough.
+
+    Holding the batch fixed is the "common random numbers" variance-reduction
+    device: the objective becomes deterministic, its gradient is exact for that
+    batch, and L-BFGS with a strong-Wolfe line search works.  The batch is
+    re-drawn between optimisation rounds so the policy does not overfit one draw.
+
+    Attributes
+    ----------
+    particles:
+        ``(P, D)`` initial states.
+    members:
+        ``(P,)`` ensemble member per particle.
+    noise:
+        ``(H, P, D)`` standard-normal draws, one per step.
+    """
+
+    particles: torch.Tensor
+    members: torch.Tensor
+    noise: torch.Tensor
+
+
+def draw_batch(mean: torch.Tensor, cov: torch.Tensor, n_particles: int,
+               horizon: int, n_members: int,
+               generator: Optional[torch.Generator] = None) -> ParticleBatch:
+    """Draw one fixed batch (see :class:`ParticleBatch`)."""
+    particles = initial_particles(mean, cov, n_particles, generator)
+    members = torch.randint(n_members, (n_particles,), generator=generator)
+    noise = torch.randn(horizon, n_particles, mean.numel(), generator=generator)
+    return ParticleBatch(particles, members, noise)
+
+
+def rollout_batch(policy: BoundedPolicy, model: DynamicsEnsemble,
+                  batch: ParticleBatch) -> Rollout:
+    """Deterministic given ``batch``: same interface as :func:`rollout`."""
+    states = [batch.particles]
+    controls, variances = [], []
+    x = batch.particles
+    for t in range(batch.noise.shape[0]):
+        u = policy(x)
+        x, var = model.step(x, u, member=batch.members, noise=batch.noise[t])
+        states.append(x)
+        controls.append(u)
+        variances.append(var)
+    return Rollout(torch.stack(states), torch.stack(controls),
+                   torch.stack(variances))
