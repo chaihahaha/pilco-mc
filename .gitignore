@@ -1,0 +1,37 @@
+# 临时与生成物
+/tmp/
+/logs/
+/results/
+/reports/
+/outputs/
+/cache/
+/envs/
+/build/
+/dist/
+
+# 视频 / 动图
+*.mp4
+*.gif
+*.webm
+
+# 大文件 / 模型
+/models/
+/weights/
+/ckpts/
+*.ckpt
+*.pth
+*.pt
+*.safetensors
+
+# 归档与数据
+/data/
+/datasets/
+*.tar.gz
+*.zip
+
+# 系统与编辑器
+.DS_Store
+__pycache__/
+.pytest_cache/
+*.pyc
+*.log
