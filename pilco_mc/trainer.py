@@ -169,13 +169,18 @@ def optimise_policy(model: DynamicsEnsemble, policy: BoundedPolicy,
         roll = rollout(policy, model, particles, config.horizon, generator, members)
         loss = expected_cost(roll, cost_fn, config.gamma, config.dropout, generator,
                              config.uncertainty_weight)
+        # Snapshot *before* the update: ``loss`` describes the current parameters,
+        # so the state matching it is the one before ``optimiser.step()``.  Saving
+        # after the step stores a policy the recorded cost does not describe, and
+        # the "best seen" bookkeeping then silently returns a worse controller
+        # (measured: recorded 37.6, returned 39.99).
+        if float(loss) < best:
+            best = float(loss)
+            best_state = copy.deepcopy(policy.state_dict())
         optimiser.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(params, 5.0)
         optimiser.step()
-        if float(loss) < best:
-            best = float(loss)
-            best_state = copy.deepcopy(policy.state_dict())
     policy.load_state_dict(best_state)
     with torch.no_grad():
         particles = initial_particles(mean0, cov0, config.particles, generator)

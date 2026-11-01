@@ -116,17 +116,51 @@ Observed failure modes along the way (numbers in [`docs/NOTES.md`](docs/NOTES.md
 * adding data (500 → 620 points), a larger optimisation budget (200 → 800
   steps), and ensemble bootstrapping all move the numbers by less than 1.
 
+There are **two independent gaps**, and only one of them is the model.
+`scripts/answer_questions.py` swaps the learned model for the *true* dynamics and
+runs the same policy search:
+
+```
+episode 1: predicted 38.74   realised 39.89
+episode 2: predicted 39.44   realised 39.35
+episode 3: predicted 38.74   realised 39.04
+```
+
+A perfect model still does not produce a swing-up.  More optimisation helps
+slowly — 2000 Adam steps instead of 250 reach 34.8, 1000 steps at twice the
+learning rate reach 38.3 — so the second gap is the **policy optimiser**: first
+order Adam on a Monte Carlo estimate is much weaker than PILCO's BFGS with line
+searches on an analytic value.
+
+The same script also answers the other three questions with measurements:
+
+* **more particles**: no.  The imagined cost at `H=40` is 38.5 for `P` from 16 to
+  1024 — already converged; more particles shrink the error bar around the wrong
+  number.  (The *gradient* does need ~128: cosine with a 8192-particle reference
+  is 0.005 at 16 particles and 0.96 at 128.)
+* **a mixture of Gaussians instead of particles**: the mixture's own moments are
+  closed form, and the *propagation* can be done without any closed-form
+  integral — 9 sigma points reproduce a Monte Carlo moment to 8% in the mean and
+  13% in the covariance.  So a GMM/ADF planner is viable, but it fixes
+  *multimodality*, not off-data bias.
+* **a branching tree**: the drift is bias, not variance — the model's particle
+  cloud spreads to 25 at `t=10` and 25471 at `t=40`, while the true spread stays
+  below 1.  Branching estimates the wrong place more precisely.  What a tree
+  *does* buy is a UCT exploration bonus and MPC-style replanning, i.e. trust
+  management rather than accuracy.
+
 ## What would fix it
 
-In order of expected effect, none of them implemented yet:
-
-1. **Multi-step training.**  Unroll the model `k` steps during the *fit* and
+1. **A stronger policy optimiser**: BFGS/line search, CEM/POPLIN, or PILCO's
+   low-dimensional controller parameterisation.  This is the gap with the largest
+   measured payoff and the cheapest to attack.
+2. **Multi-step training.**  Unroll the model `k` steps during the *fit* and
    penalise the `k`-step error, instead of fitting one-step transitions.  This is
-   the direct fix for the table above: it makes the model pay for the drift.
-2. **A calibrated model.**  GP per ensemble member, or a deep ensemble with
+   the direct fix for the drift table: it makes the model pay for the drift.
+3. **A calibrated model.**  GP per ensemble member, or a deep ensemble with
    temperature/last-layer variance — the current spread is not calibrated, so the
    uncertainty penalty is the wrong size everywhere.
-3. **Plan with a horizon the model can support** (≈10 steps) and re-plan, i.e.
+4. **Plan with a horizon the model can support** (≈10 steps) and re-plan, i.e.
    MPC.  This trades the swing-up for a shorter promise.
 
 ## Layout
