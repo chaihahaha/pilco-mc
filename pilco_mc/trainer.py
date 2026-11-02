@@ -51,7 +51,7 @@ class MCConfig:
     #: state dimension (PILCO's model).  The network's variance is fitted to the
     #: average squared error and comes out 20x too wide; a GP's posterior
     #: variance is narrow on the data and wide off it.
-    model_kind: str = "gp"
+    model_kind: str = "nn"
     members: int = 4
     hidden: int = 64
     blocks: int = 2
@@ -72,7 +72,7 @@ class MCConfig:
 
     # -- policy -----------------------------------------------------------
     #: ``"rbf"`` (PILCO's controller, few parameters) or ``"mlp"``
-    policy_kind: str = "rbf"
+    policy_kind: str = "mlp"
     #: ``"pilco"`` (PILCO's 9 sin + sin 3 saturation) or ``"tanh"``
     squash: str = "pilco"
     n_basis: int = 12

@@ -383,6 +383,14 @@ class BoundedPolicy(nn.Module):
         self.net = ResidualMLP(state_dim + len(self.angle_indices),
                                control_dim, width, blocks)
         self.register_buffer("u_max", torch.as_tensor(list(u_max), dtype=DTYPE))
+        # Start with a non-trivial **constant** control.  From the hanging state
+        # every gentle policy costs 1.0 per step, so at u(x0) ~ 0.3 N the cost is
+        # flat and the gradient is exactly zero: the optimiser does not move at
+        # all (measured: 39.99 +- 0.00 for four episodes, with either dynamics
+        # model).  A bias giving ~0.3 u_max breaks the symmetry; the state
+        # dependence is learned from there.
+        with torch.no_grad():
+            self.net.out.bias.fill_(float(torch.atanh(torch.tensor(0.3))))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.u_max * torch.tanh(self.net(_augment(x, self.angle_indices)))
