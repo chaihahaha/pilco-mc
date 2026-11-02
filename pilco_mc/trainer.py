@@ -24,7 +24,8 @@ from typing import Callable, Optional
 import numpy as np
 import torch
 
-from .nn import BoundedPolicy, DynamicsEnsemble, RbfPolicy
+from .nn import (BoundedPolicy, DynamicsEnsemble, RbfPolicy,
+                 initialise_output_scale)
 from .objective import cost_statistics, expected_cost
 from .particles import draw_batch, rollout_batch
 
@@ -112,6 +113,21 @@ class MCConfig:
     #: Monte Carlo cost saturates at "the pole has fallen" for every policy.
     #: PILCO's GP reports sd 0.0145 in-data; the raw network reports 0.245.
     variance_temperature: float = 0.02
+    #: ``|u(x0)|`` as a fraction of ``u_max`` at the start.  Too small and the
+    #: sampled cost is exactly constant (every particle pays 0.99966 per step),
+    #: so the gradient is exactly zero and no optimiser can move.
+    initial_control_fraction: float = 0.5
+    #: Warm-start the GP hyper-parameters from the previous episode.  **Measured
+    #: to hurt**: the model then stays in its initial basin and never adapts to
+    #: the swing-up data the loop starts collecting, so the predicted cost sticks
+    #: at 38 and the good policy is lost (25.3 -> 39.99 for five episodes, against
+    #: 25.3 40.0 14.9 13.3 ... with a cold refit).  Kept as an option.
+    warm_start_model: bool = False
+    #: Restore the best controller before each episode.  **Measured to hurt**:
+    #: resetting every episode stops the loop from exploring, the model's data
+    #: goes stale, and the best achievable drops (13.28 -> 14.05).  The best
+    #: controller is still returned at the end; this only controls the reset.
+    keep_best: bool = False
     #: scale of the distance-based epistemic variance, ``alpha^2 * y_sd^2``
     #: saturating away from the data (0 disables it).  The target is a
     #: ``sd(off-data)/sd(in-data)`` ratio like a GP's (measured 6.1).
@@ -133,7 +149,8 @@ class EpisodeLog:
 # model fitting
 # ---------------------------------------------------------------------------
 def fit_model(states: torch.Tensor, controls: torch.Tensor, deltas: torch.Tensor,
-              config: MCConfig, seed: int = 0) -> DynamicsEnsemble:
+              config: MCConfig, seed: int = 0,
+              previous: Optional[object] = None):
     """Maximum-likelihood fit of the ensemble, with a validation-based stop.
 
     Early stopping matters more than it looks: the ensemble is fitted on a few
@@ -146,8 +163,10 @@ def fit_model(states: torch.Tensor, controls: torch.Tensor, deltas: torch.Tensor
         from .gp import GpDynamics
         model = GpDynamics(d, du)
         model.var_temperature = config.variance_temperature
-        return model.fit(states, controls, deltas,
-                         iterations=max(40, config.model_epochs // 20))
+        model.fit(states, controls, deltas,
+                  iterations=max(40, config.model_epochs // 20),
+                  init_from=previous)
+        return model
     model = DynamicsEnsemble(d, du, members=config.members,
                              hidden=config.hidden, blocks=config.blocks)
     model.set_normalisation(states, controls, deltas)
@@ -432,6 +451,11 @@ def learn(scenario, config: Optional[MCConfig] = None,
                       states_all, controls_all, deltas_all)
 
     policy = make_policy(scenario, config, generator)
+    if not config.warm_start:
+        initialise_output_scale(policy, mean0[None],
+                                target=config.initial_control_fraction)
+    best_policy_state = copy.deepcopy(policy.state_dict())
+    best_realised = float("inf")
     if config.warm_start:
         load_policy_npz(policy, config.warm_start)
         if log is not None and config.verbose:
@@ -446,16 +470,30 @@ def learn(scenario, config: Optional[MCConfig] = None,
     logs: list[EpisodeLog] = []
     model = None
     for episode in range(config.episodes):
+        if episode > 0 and config.keep_best:
+            # Start every episode from the best controller measured so far, not
+            # from last episode's iterate.  Without this, an episode whose
+            # optimisation goes to a worse local optimum (measured: 13.28 ->
+            # 25.49) drags the whole loop down with it.
+            policy.load_state_dict(best_policy_state)
         states = torch.cat(states_all)
         controls = torch.cat(controls_all)
         deltas = torch.cat(deltas_all)
         model = fit_model(states, controls, deltas, config,
-                          seed=config.seed + episode)
+                          seed=config.seed + episode,
+                          previous=model if config.warm_start_model else None)
         predicted, stderr = optimise_policy(model, policy, scenario.cost,
                                             mean0, cov0, config, generator)
         realised = collect_policy_rollout(scenario, policy, config, mean0, cov0,
                                           rng, states_all, controls_all,
                                           deltas_all)
+        # Keep the best controller *as measured on the plant*.  The particle
+        # estimate is noisy and the model is refitted every episode, so the last
+        # iterate is not reliably the best one; returning the best seen is what
+        # turns the 13 <-> 25 oscillation into a monotone record.
+        if realised < best_realised:
+            best_realised = realised
+            best_policy_state = copy.deepcopy(policy.state_dict())
         logs.append(EpisodeLog(episode, realised, predicted, stderr,
                                int(states.shape[0])))
         if log is not None and config.verbose:
@@ -463,4 +501,7 @@ def learn(scenario, config: Optional[MCConfig] = None,
                 f"data={states.shape[0]:4d}  "
                 f"predicted {predicted:7.2f} +- {stderr:5.2f}  "
                 f"realised {realised:7.2f}")
+    policy.load_state_dict(best_policy_state)
+    if log is not None and config.verbose:
+        log(f"  returning the best controller seen: realised {best_realised:.2f}")
     return policy, model, logs

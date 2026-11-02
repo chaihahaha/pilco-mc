@@ -30,7 +30,7 @@ import torch
 import torch.nn as nn
 
 __all__ = ["ResidualMLP", "GaussianHead", "DynamicsEnsemble",
-           "BoundedPolicy", "RbfPolicy"]
+           "BoundedPolicy", "RbfPolicy", "initialise_output_scale"]
 
 DTYPE = torch.float64
 
@@ -394,3 +394,39 @@ class BoundedPolicy(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.u_max * torch.tanh(self.net(_augment(x, self.angle_indices)))
+
+
+@torch.no_grad()
+def initialise_output_scale(policy: nn.Module, x0: torch.Tensor,
+                            target: float = 0.5) -> float:
+    """Scale ``policy`` so that ``|u(x0)| = target * u_max``.
+
+    The single most important hyper-parameter in this project.  From the hanging
+    state the cost is a stationary point of the state, so a policy whose control
+    is small keeps the pole hanging and every particle pays exactly 0.99966 at
+    every step -- the sampled cost is constant, the gradient is *exactly* zero,
+    and no optimiser can move (measured: four episodes of ``39.99 +- 0.00``).
+
+    PILCO escapes this by accident: its random RBF controller happens to output
+    about 5 N.  Setting the scale explicitly removes the luck.
+
+    Returns the scale that was applied (1.0 if the policy already had the right
+    magnitude, and the gain is capped to keep the controller sane).
+    """
+    u0 = float(policy(x0)[0, 0])
+    u_max = float(policy.u_max[0])
+    if abs(u0) < 1e-9:
+        # no output at all: use the bias instead of a scale
+        if hasattr(policy, "net"):
+            policy.net.out.bias.fill_(float(torch.atanh(torch.tensor(target))))
+        else:
+            policy.weights.mul_(1.0)
+        return 1.0
+    gain = (target * u_max) / abs(u0)
+    gain = min(max(gain, 0.1), 20.0)
+    if hasattr(policy, "net"):
+        policy.net.out.weight.mul_(gain)
+        policy.net.out.bias.mul_(gain)
+    else:
+        policy.weights.mul_(gain)
+    return gain

@@ -80,7 +80,8 @@ class GpDynamics(nn.Module):
         """No-op: the GP posterior already carries the right epistemic shape."""
 
     def fit(self, states: torch.Tensor, controls: torch.Tensor,
-            deltas: torch.Tensor, iterations: int = 80) -> "GpDynamics":
+            deltas: torch.Tensor, iterations: int = 80,
+            init_from: Optional["GpDynamics"] = None) -> "GpDynamics":
         """Maximise the marginal likelihood of each output (L-BFGS)."""
         self.set_normalisation(states, controls, deltas)
         z = self._encode(states, controls).detach()
@@ -88,6 +89,13 @@ class GpDynamics(nn.Module):
         self.models = []
         for e in range(self.state_dim):
             model = _SingleGP(z, y[:, e])
+            if init_from is not None and e < len(init_from.models):
+                # warm start: last episode's hyper-parameters, then one short fit
+                # on the new data.  From scratch the marginal-likelihood optimum
+                # can land in a different basin every episode, which is what made
+                # the closed loop oscillate between 13 and 25.
+                with torch.no_grad():
+                    model.load_state_dict(init_from.models[e].state_dict())
             model.train()
             model.likelihood.train()
             mll = gpytorch.mlls.ExactMarginalLogLikelihood(model.likelihood, model)
