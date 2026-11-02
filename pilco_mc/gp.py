@@ -121,9 +121,17 @@ class GpDynamics(nn.Module):
 
     # -- prediction --------------------------------------------------------
     def predict(self, x: torch.Tensor, u: torch.Tensor,
-                member: Optional[int] = None
+                member: Optional[int] = None, encoded: bool = False
                 ) -> tuple[torch.Tensor, torch.Tensor]:
-        z = self._encode(x, u)
+        """Posterior of the state increment.
+
+        ``encoded=True`` means ``x`` already carries the trig features
+        (``[x, dx, dtheta, sin, cos]``) and must not be re-encoded -- the
+        unscented propagation assembles that layout itself.
+        """
+        z = (torch.cat([(x - self.x_mu) / self.x_sd,
+                        (u - self.u_mu) / self.u_sd], dim=-1)
+             if encoded else self._encode(x, u))
         means, vars_ = [], []
         for e, model in enumerate(self.models):
             dist = model(z)
