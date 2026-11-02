@@ -11,7 +11,10 @@ because every stage is an ARD squared-exponential kernel.  Once the moments are
 estimated from samples, nothing has to be integrable, so the model and the
 controller can be arbitrary differentiable functions.
 
-**Status: holds PILCO's performance when distilled; learns to ~27 from scratch.**  A residual-MLP policy inside the particle
+**Status: holds PILCO's level when distilled; learns to ~27 from scratch; and the
+network's real advantage is scaling, not accuracy — at 3000 points one planning
+step costs 8.5 s with a GP and 12 ms with the network (730x), and only the network
+keeps improving with more data.**  A residual-MLP policy inside the particle
 loop holds a realised cost of **12.84-13.01 across six episodes** against PILCO's
 12.8, measured on held-out test rollouts (validation and test are separate from
 the training rollout).  From scratch, without distillation, the loop learns from
