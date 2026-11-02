@@ -174,22 +174,18 @@ class UnscentedRollout:
 
         aug_m, aug_S = splice_ut(aug_m, aug_S, sat, self.i_u_raw, self.i_u)
 
-        # The model works on the raw state [x, dx, dtheta]; the augmented slots
-        # carry sin/cos, so recover theta.  atan2 is exact for |theta| < pi, which
-        # is the whole range this task visits.
-        def to_state(z):
-            parts = z[:-1]
-            sin_t, cos_t = parts[-2], parts[-1]
-            return torch.cat([parts[:-2], torch.atan2(sin_t, cos_t)[None]])
-
+        # The model reads the trig-augmented state directly (as PILCO's GP does),
+        # so the ``[x, dx, dtheta, sin, cos | u]`` block can be passed straight
+        # through -- no ``atan2`` reconstruction, which used to amplify the sigma
+        # points and leave the belief 11x too wide at t=40.
         def dynamics(z):
-            x4, u = to_state(z), z[-1:]
-            delta, _ = self.model.predict(x4[None], u.reshape(1, -1))
+            delta, _ = self.model.predict(z[:-1][None], z[-1:].reshape(1, -1),
+                                          augmented=True)
             return delta[0]
 
-        _, var_now = self.model.predict(
-            to_state(aug_m[self.gp_idx])[None],
-            aug_m[self.i_u].reshape(1, -1))
+        _, var_now = self.model.predict(aug_m[self.gp_idx][:-1][None],
+                                        aug_m[self.i_u].reshape(1, -1),
+                                        augmented=True)
         aug_m, aug_S = splice_ut(aug_m, aug_S, dynamics, self.gp_idx,
                                  self.i_dyn,
                                  noise=torch.diag(var_now[0].clamp(min=0.0)))

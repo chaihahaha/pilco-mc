@@ -120,16 +120,24 @@ class DynamicsEnsemble(nn.Module):
     """
 
     def __init__(self, state_dim: int, control_dim: int, members: int = 4,
-                 hidden: int = 64, blocks: int = 2):
+                 hidden: int = 64, blocks: int = 2,
+                 angle_indices: Sequence[int] = ()):
         super().__init__()
         self.state_dim = int(state_dim)
         self.control_dim = int(control_dim)
+        #: The model reads the trig-augmented state, exactly like PILCO's GP
+        #: (``plant.angi``).  Without sin/cos the network has to approximate a
+        #: periodic function on the real line, and the unscented propagation had
+        #: to undo the augmentation with an ``atan2`` that amplified the sigma
+        #: points (measured: 11x too wide a belief at t=40).
+        self.angle_indices = tuple(angle_indices)
+        n_aug = state_dim + len(self.angle_indices)   # angle -> sin, cos
         self.members = nn.ModuleList([
-            GaussianHead(state_dim + control_dim, state_dim, hidden, blocks)
+            GaussianHead(n_aug + control_dim, state_dim, hidden, blocks)
             for _ in range(members)])
         # normalisation statistics; filled by ``set_normalisation``
-        self.register_buffer("x_mu", torch.zeros(state_dim, dtype=DTYPE))
-        self.register_buffer("x_sd", torch.ones(state_dim, dtype=DTYPE))
+        self.register_buffer("x_mu", torch.zeros(n_aug, dtype=DTYPE))
+        self.register_buffer("x_sd", torch.ones(n_aug, dtype=DTYPE))
         self.register_buffer("u_mu", torch.zeros(control_dim, dtype=DTYPE))
         self.register_buffer("u_sd", torch.ones(control_dim, dtype=DTYPE))
         self.register_buffer("y_mu", torch.zeros(state_dim, dtype=DTYPE))
@@ -162,14 +170,17 @@ class DynamicsEnsemble(nn.Module):
         def stats(t: torch.Tensor):
             return t.mean(0), t.std(0).clamp(min=1e-6)
         with torch.no_grad():
-            self.x_mu, self.x_sd = stats(states)
+            self.x_mu, self.x_sd = stats(_augment(states, self.angle_indices))
             self.u_mu, self.u_sd = stats(controls)
             self.y_mu, self.y_sd = stats(deltas)
             self.train_z = self._encode(states, controls).clone()
 
-    def _encode(self, x: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
-        return torch.cat([(x - self.x_mu) / self.x_sd,
+    def _encode_aug(self, x5: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+        return torch.cat([(x5 - self.x_mu) / self.x_sd,
                           (u - self.u_mu) / self.u_sd], dim=-1)
+
+    def _encode(self, x: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+        return self._encode_aug(_augment(x, self.angle_indices), u)
 
     def set_epistemic(self, alpha: float = 1.0, quantile: float = 0.5) -> None:
         """Configure the distance-based epistemic variance.
@@ -263,15 +274,16 @@ class DynamicsEnsemble(nn.Module):
 
     # -- prediction ---------------------------------------------------------
     def predict(self, x: torch.Tensor, u: torch.Tensor,
-                member: Optional[int] = None
+                member: Optional[int] = None, augmented: bool = False
                 ) -> tuple[torch.Tensor, torch.Tensor]:
         """Physical-space ``(mean_delta, variance_delta)``.
 
         With ``member=None`` the mean is the ensemble average and the variance
         adds the between-member spread (the law of total variance); that is the
-        uncertainty a particle should be sampled from.
+        uncertainty a particle should be sampled from.  ``augmented=True`` means
+        ``x`` already carries the sin/cos columns.
         """
-        z = self._encode(x, u)
+        z = self._encode_aug(x, u) if augmented else self._encode(x, u)
         models = self.members if member is None else [self.members[member]]
         means, variances = [], []
         for m in models:
@@ -291,7 +303,8 @@ class DynamicsEnsemble(nn.Module):
     def step(self, x: torch.Tensor, u: torch.Tensor,
              generator: Optional[torch.Generator] = None,
              member: Optional[torch.Tensor] = None,
-             noise: Optional[torch.Tensor] = None
+             noise: Optional[torch.Tensor] = None,
+             augmented: bool = False
              ) -> tuple[torch.Tensor, torch.Tensor]:
         """One reparameterised draw of ``x_{t+1}``, plus the variance it used.
 
@@ -309,7 +322,7 @@ class DynamicsEnsemble(nn.Module):
         n = x.shape[0]
         if member is None:
             member = torch.randint(len(self.members), (n,), generator=generator)
-        z = self._encode(x, u)
+        z = self._encode_aug(x, u) if augmented else self._encode(x, u)
         mean = torch.zeros(n, self.state_dim, dtype=x.dtype)
         var = torch.zeros_like(mean)
         for k, m in enumerate(self.members):

@@ -55,32 +55,42 @@ class GpDynamics(nn.Module):
     one-element list so that callers which draw an ensemble index keep working.
     """
 
-    def __init__(self, state_dim: int, control_dim: int, **_: object):
+    def __init__(self, state_dim: int, control_dim: int,
+                 angle_indices: Sequence[int] = (), **_: object):
         super().__init__()
         self.state_dim = int(state_dim)
         self.control_dim = int(control_dim)
         self.members = [None]
         self.models: list[_SingleGP] = []
         # normalisation, same convention as the network
-        self.register_buffer("x_mu", torch.zeros(state_dim, dtype=DTYPE))
-        self.register_buffer("x_sd", torch.ones(state_dim, dtype=DTYPE))
+        n_aug = state_dim + len(tuple(angle_indices))  # angle -> sin, cos
+        self.register_buffer("x_mu", torch.zeros(n_aug, dtype=DTYPE))
+        self.register_buffer("x_sd", torch.ones(n_aug, dtype=DTYPE))
         self.register_buffer("u_mu", torch.zeros(control_dim, dtype=DTYPE))
         self.register_buffer("u_sd", torch.ones(control_dim, dtype=DTYPE))
         self.register_buffer("y_mu", torch.zeros(state_dim, dtype=DTYPE))
         self.register_buffer("y_sd", torch.ones(state_dim, dtype=DTYPE))
+        #: The GP reads the trig-augmented state, as PILCO's does.
+        self.angle_indices = tuple(angle_indices)
         self.epistemic_scale = 0.0
         self.var_temperature = 1.0
 
     # -- interface parity with DynamicsEnsemble ----------------------------
     def set_normalisation(self, states, controls, deltas) -> None:
+        from .nn import _augment
         with torch.no_grad():
-            self.x_mu, self.x_sd = states.mean(0), states.std(0).clamp(min=1e-6)
+            aug = _augment(states, self.angle_indices)
+            self.x_mu, self.x_sd = aug.mean(0), aug.std(0).clamp(min=1e-6)
             self.u_mu, self.u_sd = controls.mean(0), controls.std(0).clamp(min=1e-6)
             self.y_mu, self.y_sd = deltas.mean(0), deltas.std(0).clamp(min=1e-6)
 
-    def _encode(self, x: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
-        return torch.cat([(x - self.x_mu) / self.x_sd,
+    def _encode_aug(self, x5: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+        return torch.cat([(x5 - self.x_mu) / self.x_sd,
                           (u - self.u_mu) / self.u_sd], dim=-1)
+
+    def _encode(self, x: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+        from .nn import _augment
+        return self._encode_aug(_augment(x, self.angle_indices), u)
 
     def set_epistemic(self, *args, **kwargs) -> None:
         """No-op: the GP posterior already carries the right epistemic shape."""
@@ -121,17 +131,15 @@ class GpDynamics(nn.Module):
 
     # -- prediction --------------------------------------------------------
     def predict(self, x: torch.Tensor, u: torch.Tensor,
-                member: Optional[int] = None, encoded: bool = False
+                member: Optional[int] = None, augmented: bool = False
                 ) -> tuple[torch.Tensor, torch.Tensor]:
         """Posterior of the state increment.
 
-        ``encoded=True`` means ``x`` already carries the trig features
-        (``[x, dx, dtheta, sin, cos]``) and must not be re-encoded -- the
+        ``augmented=True`` means ``x`` already carries the trig features
+        (``[x, dx, dtheta, sin, cos]``) and must not be augmented again -- the
         unscented propagation assembles that layout itself.
         """
-        z = (torch.cat([(x - self.x_mu) / self.x_sd,
-                        (u - self.u_mu) / self.u_sd], dim=-1)
-             if encoded else self._encode(x, u))
+        z = self._encode_aug(x, u) if augmented else self._encode(x, u)
         means, vars_ = [], []
         for e, model in enumerate(self.models):
             dist = model(z)

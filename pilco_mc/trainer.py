@@ -80,6 +80,8 @@ class MCConfig:
     policy_kind: str = "mlp"
     #: ``"pilco"`` (PILCO's 9 sin + sin 3 saturation) or ``"tanh"``
     squash: str = "pilco"
+    #: angle coordinates, so the models read [x, trig] like PILCO's GP
+    angle_indices: tuple = ()
     n_basis: int = 12
     #: width / depth of the residual-MLP policy.  With 40 data points a 4.5k
     #: parameter network cannot be optimised from a random start; matching the
@@ -209,7 +211,7 @@ def fit_model(states: torch.Tensor, controls: torch.Tensor, deltas: torch.Tensor
     d, du = states.shape[1], controls.shape[1]
     if config.model_kind == "gp":
         from .gp import GpDynamics
-        model = GpDynamics(d, du)
+        model = GpDynamics(d, du, angle_indices=config.angle_indices)
         model.var_temperature = config.variance_temperature
         model.fit(states, controls, deltas,
                   iterations=(config.gp_iterations
@@ -217,7 +219,8 @@ def fit_model(states: torch.Tensor, controls: torch.Tensor, deltas: torch.Tensor
                   init_from=previous)
         return model
     model = DynamicsEnsemble(d, du, members=config.members,
-                             hidden=config.hidden, blocks=config.blocks)
+                             hidden=config.hidden, blocks=config.blocks,
+                             angle_indices=config.angle_indices)
     model.set_normalisation(states, controls, deltas)
     if config.epistemic_alpha > 0.0:
         model.set_epistemic(config.epistemic_alpha)
@@ -522,6 +525,8 @@ def learn(scenario, config: Optional[MCConfig] = None,
           log: Optional[Callable[[str], None]] = print):
     """Run the full loop on ``scenario``; returns ``(policy, model, logs)``."""
     config = config or MCConfig()
+    if not config.angle_indices and getattr(scenario, "angle_indices", None):
+        config.angle_indices = tuple(scenario.angle_indices)
     torch.manual_seed(config.seed)
     np.random.seed(config.seed)
     generator = torch.Generator().manual_seed(config.seed)
