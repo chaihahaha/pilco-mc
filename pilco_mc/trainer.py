@@ -126,6 +126,13 @@ class MCConfig:
     #: at 38 and the good policy is lost (25.3 -> 39.99 for five episodes, against
     #: 25.3 40.0 14.9 13.3 ... with a cold refit).  Kept as an option.
     warm_start_model: bool = False
+    #: Report and decide on **separate** rollouts from the one used for data.
+    #: With this on, each episode runs three rollouts on the plant: one for the
+    #: dataset, one for the accept/reject decision, one for the reported number.
+    #: That costs 2 extra rollouts (80 steps) per episode and removes the
+    #: selection bias that made an earlier version report the best of a noisy
+    #: sequence as if it were the convergence point.
+    honest_protocol: bool = True
     #: Accept the optimised controller only if it is better *on the plant*.
     #: The optimiser works inside the model; when the model is wrong the policy
     #: can improve there and get worse in reality (measured: 13.28 -> 25.49).
@@ -449,6 +456,19 @@ def collect_policy_rollout(scenario, policy, config: MCConfig, mean0, cov0,
     return float(np.sum(costs))
 
 
+def evaluate_policy(scenario, policy, mean0, cov0, rng) -> float:
+    """One rollout on the true system that is **not** added to the dataset.
+
+    Used for decisions (accept/reject) and for reporting, kept separate from the
+    rollout that produces training data.  Using the training rollout for either
+    is leakage: the number that decides which controller to keep must not be the
+    number that is reported.
+    """
+    x0 = mean0.numpy() + np.linalg.cholesky(cov0.numpy()) @ rng.standard_normal(4)
+    _, costs = scenario.rollout_true(policy, x0, scenario.horizon, rng)
+    return float(np.sum(costs))
+
+
 def learn(scenario, config: Optional[MCConfig] = None,
           log: Optional[Callable[[str], None]] = print):
     """Run the full loop on ``scenario``; returns ``(policy, model, logs)``."""
@@ -468,7 +488,8 @@ def learn(scenario, config: Optional[MCConfig] = None,
         initialise_output_scale(policy, mean0[None],
                                 target=config.initial_control_fraction)
     best_policy_state = copy.deepcopy(policy.state_dict())
-    best_realised = float("inf")
+    best_reported = float("inf")
+    best_decision = float("inf")
     if config.warm_start:
         load_policy_npz(policy, config.warm_start)
         if log is not None and config.verbose:
@@ -509,24 +530,31 @@ def learn(scenario, config: Optional[MCConfig] = None,
         realised = collect_policy_rollout(scenario, policy, config, mean0, cov0,
                                           rng, states_all, controls_all,
                                           deltas_all)
-        # Keep the best controller *as measured on the plant*.  The particle
-        # estimate is noisy and the model is refitted every episode, so the last
-        # iterate is not reliably the best one; returning the best seen is what
-        # turns the 13 <-> 25 oscillation into a monotone record.
-        if realised < best_realised:
-            best_realised = realised
+        if config.honest_protocol:
+            # Decide on a validation rollout and report on a *different* test
+            # rollout.  Neither is added to the training set.  Using the training
+            # rollout for the decision and the report is what made an earlier
+            # version quote the best of a noisy sequence as its result.
+            decision_cost = evaluate_policy(scenario, policy, mean0, cov0, rng)
+            reported = evaluate_policy(scenario, policy, mean0, cov0, rng)
+        else:
+            decision_cost = reported = realised
+
+        if decision_cost < best_decision:
+            best_decision = decision_cost
+            best_reported = reported
             best_policy_state = copy.deepcopy(policy.state_dict())
         elif config.accept_by_rollout:
             # not better on the plant: keep the data, drop the controller
             policy.load_state_dict(best_policy_state)
-        logs.append(EpisodeLog(episode, realised, predicted, stderr,
+        logs.append(EpisodeLog(episode, reported, predicted, stderr,
                                int(states.shape[0])))
         if log is not None and config.verbose:
             log(f"  episode {episode + 1}/{config.episodes}: "
                 f"data={states.shape[0]:4d}  "
                 f"predicted {predicted:7.2f} +- {stderr:5.2f}  "
-                f"realised {realised:7.2f}")
+                f"realised {reported:7.2f}")
     policy.load_state_dict(best_policy_state)
     if log is not None and config.verbose:
-        log(f"  returning the best controller seen: realised {best_realised:.2f}")
+        log(f"  best-by-validation controller: test cost {best_reported:.2f}")
     return policy, model, logs

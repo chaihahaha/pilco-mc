@@ -11,9 +11,11 @@ because every stage is an ARD squared-exponential kernel.  Once the moments are
 estimated from samples, nothing has to be integrable, so the model and the
 controller can be arbitrary differentiable functions.
 
-**Status: converges to PILCO's performance.**  A residual-MLP policy inside the
-particle loop reaches a realised cost of **12.85** (seed 0) and **12.82** (seed 1)
-against PILCO's 12.8, and holds ~12.9 for several consecutive episodes.  Two
+**Status: holds PILCO's performance when distilled; learns to ~27 from scratch.**  A residual-MLP policy inside the particle
+loop holds a realised cost of **12.84-13.01 across six episodes** against PILCO's
+12.8, measured on held-out test rollouts (validation and test are separate from
+the training rollout).  From scratch, without distillation, the loop learns from
+**39.3 to 26.4** over eight episodes, also under the honest protocol.  Two
 caveats: it needs a **distilled** initialisation (the swing-up is not discovered
 from scratch), and the neural *dynamics* model still does not work -- these runs
 use a GP.  The three defects that had to be fixed first (variance calibration,
