@@ -275,9 +275,11 @@ class RbfPolicy(nn.Module):
     def __init__(self, state_dim: int, control_dim: int,
                  u_max: Sequence[float], n_basis: int = 12,
                  generator: Optional[torch.Generator] = None,
-                 angle_indices: Sequence[int] = ()):
+                 angle_indices: Sequence[int] = (),
+                 squash: str = "pilco"):
         super().__init__()
         self.angle_indices = tuple(angle_indices)
+        self.squash = squash
         n_in = state_dim + len(self.angle_indices)     # angle -> sin, cos
         self.centers = nn.Parameter(0.5 * torch.randn(n_basis, n_in,
                                                       dtype=DTYPE, generator=generator))
@@ -295,7 +297,14 @@ class RbfPolicy(nn.Module):
         x = _augment(x, self.angle_indices)
         inv_ell2 = torch.exp(-2.0 * self.log_lengthscales)      # 1 / ell^2
         d2 = ((x[:, None, :] - self.centers[None]) ** 2 * inv_ell2).sum(-1)
-        return self.u_max * torch.tanh(torch.exp(-0.5 * d2) @ self.weights)
+        raw = torch.exp(-0.5 * d2) @ self.weights
+        if self.squash == "pilco":
+            # PILCO's saturating output: (9 sin u + sin 3u) / 8, which reaches
+            # exactly 1 at u = pi/2.  With this the policy can represent PILCO's
+            # controller *exactly*, which is what makes the warm start below an
+            # exact transfer rather than a least-squares fit.
+            return self.u_max * (9.0 * torch.sin(raw) + torch.sin(3.0 * raw)) / 8.0
+        return self.u_max * torch.tanh(raw)
 
 
 class BoundedPolicy(nn.Module):

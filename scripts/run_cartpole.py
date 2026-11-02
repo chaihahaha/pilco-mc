@@ -34,6 +34,10 @@ def main() -> int:
     ap.add_argument("--model-epochs", type=int, default=600)
     ap.add_argument("--members", type=int, default=4)
     ap.add_argument("--dropout", type=float, default=0.1)
+    ap.add_argument("--warm-start", default=None,
+                    help="path to a pilco_pytorch controller .npz to start from")
+    ap.add_argument("--policy-optimizer", default="cem",
+                    choices=["cem", "lbfgs"])
     ap.add_argument("--smoke", action="store_true",
                     help="tiny settings that finish in about a minute")
     ap.add_argument("--out", default=None)
@@ -49,6 +53,8 @@ def main() -> int:
                       policy_steps=args.policy_steps,
                       model_epochs=args.model_epochs,
                       members=args.members, dropout=args.dropout,
+                      warm_start=args.warm_start,
+                      policy_optimizer=args.policy_optimizer,
                       verbose=True)
     t0 = time.time()
     policy, model, logs = learn(scenario, config)

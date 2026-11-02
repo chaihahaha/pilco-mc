@@ -26,9 +26,10 @@ import torch
 
 from .nn import BoundedPolicy, DynamicsEnsemble, RbfPolicy
 from .objective import cost_statistics, expected_cost
-from .particles import draw_batch, initial_particles, rollout, rollout_batch
+from .particles import draw_batch, rollout_batch
 
-__all__ = ["MCConfig", "EpisodeLog", "fit_model", "optimise_policy", "learn"]
+__all__ = ["MCConfig", "EpisodeLog", "fit_model", "optimise_policy",
+           "learn", "collect_seed_data", "load_policy_npz"]
 
 
 @dataclass
@@ -57,7 +58,11 @@ class MCConfig:
     # -- policy -----------------------------------------------------------
     #: ``"rbf"`` (PILCO's controller, few parameters) or ``"mlp"``
     policy_kind: str = "rbf"
+    #: ``"pilco"`` (PILCO's 9 sin + sin 3 saturation) or ``"tanh"``
+    squash: str = "pilco"
     n_basis: int = 12
+    #: path to a ``.npz`` controller from ``../pilco_pytorch`` to warm-start from
+    warm_start: Optional[str] = None
     #: optimisation rounds; each round re-draws the particle batch and runs an
     #: L-BFGS line search on the (now deterministic) objective
     policy_rounds: int = 8
@@ -293,20 +298,14 @@ def optimise_policy(model: DynamicsEnsemble, policy,
 # ---------------------------------------------------------------------------
 # the loop
 # ---------------------------------------------------------------------------
-def learn(scenario, config: Optional[MCConfig] = None,
-          log: Optional[Callable[[str], None]] = print):
-    """Run the full loop on ``scenario``; returns ``(policy, model, logs)``."""
-    config = config or MCConfig()
-    torch.manual_seed(config.seed)
-    np.random.seed(config.seed)
-    generator = torch.Generator().manual_seed(config.seed)
-    rng = np.random.default_rng(config.seed + 1000)
-    mean0, cov0 = scenario.initial_belief()
+def collect_seed_data(scenario, config: MCConfig, mean0, cov0, rng,
+                      states_all, controls_all, deltas_all) -> None:
+    """Uniformly random controls, so the first model sees the whole actuator range.
 
-    # -- initial data: uniformly random controls, so the first model sees the
-    # whole actuator range rather than whatever the untrained policy happens to
-    # output.
-    states_all, controls_all, deltas_all = [], [], []
+    The alternative -- let the untrained policy generate the first data -- biases
+    the model towards whatever near-zero output a random network happens to
+    produce.
+    """
     for _ in range(config.initial_rollouts):
         x = mean0.numpy() + np.linalg.cholesky(cov0.numpy()) @ rng.standard_normal(4)
         states, costs = [], []
@@ -325,38 +324,99 @@ def learn(scenario, config: Optional[MCConfig] = None,
         controls_all.append(j)
         deltas_all.append(k)
 
-    if config.policy_kind == "rbf":
-        policy = RbfPolicy(scenario.state_dim, scenario.control_dim,
-                           [scenario.u_max], config.n_basis, generator,
-                           angle_indices=scenario.angle_indices)
+
+def load_policy_npz(policy, path: str) -> None:
+    """Copy an ``RbfPolicy`` from a controller saved by ``pilco_pytorch``.
+
+    The two parameterisations match store-for-store (``centers``,
+    ``lengthscales``, ``beta``), so this is an exact transfer when
+    ``squash="pilco"``.
+    """
+    data = np.load(path)
+    centers = np.asarray(data["centers"])
+    ell = np.asarray(data["lengthscales"])
+    if "beta" in data:
+        beta = np.asarray(data["beta"])
     else:
-        policy = BoundedPolicy(scenario.state_dim, scenario.control_dim,
-                               [scenario.u_max],
-                               angle_indices=scenario.angle_indices)
+        # an older cache stores only the pseudo-targets; the network *weights*
+        # are beta = (K + sigma_n^2 I)^{-1} T with sigma_n = 0.01 and unit signal
+        diff = ((centers[:, None, :] - centers[None, :, :]) / ell[None, None, :]) ** 2
+        gram = np.exp(-0.5 * diff.sum(-1))
+        beta = np.linalg.solve(gram + 1e-4 * np.eye(len(centers)),
+                               np.asarray(data["targets"]))
+    with torch.no_grad():
+        policy.centers.copy_(torch.as_tensor(centers))
+        policy.log_lengthscales.copy_(torch.log(torch.as_tensor(ell)))
+        policy.weights.copy_(torch.as_tensor(beta))
+
+
+def make_policy(scenario, config: MCConfig, generator: torch.Generator):
+    """The controller for this run (PILCO-style RBF, or a residual MLP)."""
+    if config.policy_kind == "rbf":
+        return RbfPolicy(scenario.state_dim, scenario.control_dim,
+                         [scenario.u_max], config.n_basis, generator,
+                         angle_indices=scenario.angle_indices,
+                         squash=config.squash)
+    return BoundedPolicy(scenario.state_dim, scenario.control_dim,
+                         [scenario.u_max],
+                         angle_indices=scenario.angle_indices)
+
+
+def collect_policy_rollout(scenario, policy, config: MCConfig, mean0, cov0,
+                           rng, states_all, controls_all, deltas_all) -> float:
+    """One policy rollout on the true system, appended to the dataset."""
+    x0 = mean0.numpy() + np.linalg.cholesky(cov0.numpy()) @ rng.standard_normal(4)
+    traj, costs = scenario.rollout_true(policy, x0, config.horizon, rng)
+    us = []
+    for t in range(config.horizon):
+        with torch.no_grad():
+            us.append(float(policy(torch.as_tensor(traj[t:t + 1]))[0, 0]))
+    i, j, k = scenario.transitions(traj, np.asarray(us))
+    states_all.append(i)
+    controls_all.append(j)
+    deltas_all.append(k)
+    return float(np.sum(costs))
+
+
+def learn(scenario, config: Optional[MCConfig] = None,
+          log: Optional[Callable[[str], None]] = print):
+    """Run the full loop on ``scenario``; returns ``(policy, model, logs)``."""
+    config = config or MCConfig()
+    torch.manual_seed(config.seed)
+    np.random.seed(config.seed)
+    generator = torch.Generator().manual_seed(config.seed)
+    rng = np.random.default_rng(config.seed + 1000)
+    mean0, cov0 = scenario.initial_belief()
+
+    states_all, controls_all, deltas_all = [], [], []
+    collect_seed_data(scenario, config, mean0, cov0, rng,
+                      states_all, controls_all, deltas_all)
+
+    policy = make_policy(scenario, config, generator)
+    if config.warm_start:
+        load_policy_npz(policy, config.warm_start)
+        if log is not None and config.verbose:
+            log(f"  warm start: policy loaded from {config.warm_start}")
+        # The model has only seen random-control data at this point, i.e. it has
+        # never seen the pole near upright.  Without this rollout the model rates
+        # a 13-cost controller at 39.9 and the first policy optimisation throws
+        # it away (measured).
+        collect_policy_rollout(scenario, policy, config, mean0, cov0, rng,
+                               states_all, controls_all, deltas_all)
+
     logs: list[EpisodeLog] = []
     model = None
-
     for episode in range(config.episodes):
         states = torch.cat(states_all)
         controls = torch.cat(controls_all)
         deltas = torch.cat(deltas_all)
-        model = fit_model(states, controls, deltas, config, seed=config.seed + episode)
+        model = fit_model(states, controls, deltas, config,
+                          seed=config.seed + episode)
         predicted, stderr = optimise_policy(model, policy, scenario.cost,
                                             mean0, cov0, config, generator)
-
-        # -- roll the policy out on the true system and append the data
-        x0 = mean0.numpy() + np.linalg.cholesky(cov0.numpy()) @ rng.standard_normal(4)
-        traj, costs = scenario.rollout_true(policy, x0, config.horizon, rng)
-        u = []
-        for t in range(config.horizon):
-            with torch.no_grad():
-                u.append(float(policy(torch.as_tensor(traj[t:t + 1]))[0, 0]))
-        i, j, k = scenario.transitions(traj, np.asarray(u))
-        states_all.append(i)
-        controls_all.append(j)
-        deltas_all.append(k)
-
-        realised = float(np.sum(costs))
+        realised = collect_policy_rollout(scenario, policy, config, mean0, cov0,
+                                          rng, states_all, controls_all,
+                                          deltas_all)
         logs.append(EpisodeLog(episode, realised, predicted, stderr,
                                int(states.shape[0])))
         if log is not None and config.verbose:
