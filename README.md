@@ -11,11 +11,14 @@ because every stage is an ARD squared-exponential kernel.  Once the moments are
 estimated from samples, nothing has to be integrable, so the model and the
 controller can be arbitrary differentiable functions.
 
-**Status: a neural policy (residual MLP) now drives the cart-pole swing-up in
-the closed loop, at a cost of 13.3 against PILCO's 12.8 -- but only when
-warm-started by distilling PILCO's controller, and the loop oscillates between 13
-and 25-40 rather than settling.  The neural *dynamics* model does not work even
-then.**  Two rounds of "fix what is broken" closed
+**Status: converges to PILCO's performance.**  A residual-MLP policy inside the
+particle loop reaches a realised cost of **12.85** (seed 0) and **12.82** (seed 1)
+against PILCO's 12.8, and holds ~12.9 for several consecutive episodes.  Two
+caveats: it needs a **distilled** initialisation (the swing-up is not discovered
+from scratch), and the neural *dynamics* model still does not work -- these runs
+use a GP.  The three defects that had to be fixed first (variance calibration,
+the exact-saturation plateau, and the per-episode oscillation) are documented in
+[docs/NOTES.md](docs/NOTES.md).  Two rounds of "fix what is broken" closed
 five real defects — best single-optimisation result went from 40 to 27 — yet the
 closed loop still sits at ~39.  The remaining gap is the policy-search landscape,
 not the estimator and not the model class.  Details and the next three steps are

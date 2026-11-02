@@ -123,6 +123,15 @@ class MCConfig:
     #: at 38 and the good policy is lost (25.3 -> 39.99 for five episodes, against
     #: 25.3 40.0 14.9 13.3 ... with a cold refit).  Kept as an option.
     warm_start_model: bool = False
+    #: Accept the optimised controller only if it is better *on the plant*.
+    #: The optimiser works inside the model; when the model is wrong the policy
+    #: can improve there and get worse in reality (measured: 13.28 -> 25.49).
+    #: This costs no extra interaction -- the episode's rollout is the evaluation.
+    accept_by_rollout: bool = True
+    #: How far the policy may move in one episode: the update is
+    #: ``theta = (1 - blend) * theta_prev + blend * theta_new``.  1.0 disables the
+    #: trust region and lets the optimiser jump wherever it likes.
+    policy_blend: float = 0.5
     #: Restore the best controller before each episode.  **Measured to hurt**:
     #: resetting every episode stops the loop from exploring, the model's data
     #: goes stale, and the best achievable drops (13.28 -> 14.05).  The best
@@ -482,8 +491,17 @@ def learn(scenario, config: Optional[MCConfig] = None,
         model = fit_model(states, controls, deltas, config,
                           seed=config.seed + episode,
                           previous=model if config.warm_start_model else None)
+        before = copy.deepcopy(policy.state_dict())
         predicted, stderr = optimise_policy(model, policy, scenario.cost,
                                             mean0, cov0, config, generator)
+        if config.policy_blend < 1.0:
+            # trust region: move only part of the way to the new parameters
+            with torch.no_grad():
+                after = policy.state_dict()
+                policy.load_state_dict({
+                    k: (1.0 - config.policy_blend) * before[k]
+                       + config.policy_blend * after[k]
+                    for k in after})
         realised = collect_policy_rollout(scenario, policy, config, mean0, cov0,
                                           rng, states_all, controls_all,
                                           deltas_all)
@@ -494,6 +512,9 @@ def learn(scenario, config: Optional[MCConfig] = None,
         if realised < best_realised:
             best_realised = realised
             best_policy_state = copy.deepcopy(policy.state_dict())
+        elif config.accept_by_rollout:
+            # not better on the plant: keep the data, drop the controller
+            policy.load_state_dict(best_policy_state)
         logs.append(EpisodeLog(episode, realised, predicted, stderr,
                                int(states.shape[0])))
         if log is not None and config.verbose:
