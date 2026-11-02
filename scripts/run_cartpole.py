@@ -38,6 +38,9 @@ def main() -> int:
                     help="path to a pilco_pytorch controller .npz to start from")
     ap.add_argument("--model-kind", default="nn", choices=["gp", "nn"])
     ap.add_argument("--policy-kind", default="mlp", choices=["rbf", "mlp"])
+    ap.add_argument("--initial-rollouts", type=int, default=5)
+    ap.add_argument("--initial-steps", type=int, default=100)
+    ap.add_argument("--gp-iterations", type=int, default=0)
     ap.add_argument("--variance-temperature", type=float, default=1.0)
     ap.add_argument("--policy-rounds", type=int, default=8)
     ap.add_argument("--lbfgs-iter", type=int, default=20)
@@ -61,6 +64,9 @@ def main() -> int:
                       warm_start=args.warm_start,
                       model_kind=args.model_kind,
                       policy_kind=args.policy_kind,
+                      initial_rollouts=args.initial_rollouts,
+                      initial_steps=args.initial_steps,
+                      gp_iterations=args.gp_iterations,
                       variance_temperature=args.variance_temperature,
                       policy_rounds=args.policy_rounds,
                       lbfgs_max_iter=args.lbfgs_iter,

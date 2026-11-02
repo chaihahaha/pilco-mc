@@ -336,13 +336,20 @@ class RbfPolicy(nn.Module):
                  u_max: Sequence[float], n_basis: int = 12,
                  generator: Optional[torch.Generator] = None,
                  angle_indices: Sequence[int] = (),
-                 squash: str = "pilco"):
+                 squash: str = "pilco",
+                 centre_scale: float = 0.1):
         super().__init__()
         self.angle_indices = tuple(angle_indices)
         self.squash = squash
         n_in = state_dim + len(self.angle_indices)     # angle -> sin, cos
-        self.centers = nn.Parameter(0.5 * torch.randn(n_basis, n_in,
-                                                      dtype=DTYPE, generator=generator))
+        # Centres drawn from the *initial belief* (std ~0.1), as PILCO does.
+        # With spread-out centres every kernel is ~0.6 for every state and the
+        # controller is a constant: the pole settles at a tilted equilibrium, the
+        # cost saturates at 0.99966 per step and the gradient is exactly zero.
+        # With centres at the origin k(x, c) ~ exp(-|x|^2 / 2) is a genuine
+        # function of the state, which is what lets the first trajectory move.
+        self.centers = nn.Parameter(centre_scale * torch.randn(
+            n_basis, n_in, dtype=DTYPE, generator=generator))
         self.log_lengthscales = nn.Parameter(torch.zeros(n_in, dtype=DTYPE))
         #: The scale of the initial weights decides whether the policy search
         #: starts on the "do nothing" plateau: with u(x0) ~ 0.3 N the cost is

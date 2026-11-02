@@ -32,10 +32,16 @@ class _SingleGP(gpytorch.models.ExactGP):
 
     def __init__(self, inputs: torch.Tensor, targets: torch.Tensor):
         super().__init__(inputs, targets,
-                         gpytorch.likelihoods.GaussianLikelihood())
+                         gpytorch.likelihoods.GaussianLikelihood(
+                             # PILCO's curb in spirit: without a floor the
+                             # marginal likelihood on 40 points drives the noise
+                             # to ~0 and the Cholesky returns NaN (measured).
+                             noise_constraint=gpytorch.constraints.GreaterThan(1e-4)))
         self.mean_module = gpytorch.means.ZeroMean()
         self.covar_module = gpytorch.kernels.ScaleKernel(
-            gpytorch.kernels.RBFKernel(ard_num_dims=inputs.shape[1]))
+            gpytorch.kernels.RBFKernel(
+                ard_num_dims=inputs.shape[1],
+                lengthscale_constraint=gpytorch.constraints.Interval(1e-2, 1e2)))
 
     def forward(self, x: torch.Tensor) -> gpytorch.distributions.MultivariateNormal:
         return gpytorch.distributions.MultivariateNormal(

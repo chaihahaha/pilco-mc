@@ -61,6 +61,9 @@ class MCConfig:
     #: error is ~0.007, so every particle samples noise 300x the process noise;
     #: at 3000 epochs it reaches ~0.32, which is the right order of magnitude.
     model_epochs: int = 1500
+    #: L-BFGS iterations for the GP hyper-parameters (0 = derive from
+    #: ``model_epochs``).  PILCO runs 150 line searches per output.
+    gp_iterations: int = 0
     model_lr: float = 3e-3
     #: weight decay is off: applied to the log-variance head it pulls the
     #: predictive variance back to 1 (in normalised units), i.e. ~300x the true
@@ -173,7 +176,8 @@ def fit_model(states: torch.Tensor, controls: torch.Tensor, deltas: torch.Tensor
         model = GpDynamics(d, du)
         model.var_temperature = config.variance_temperature
         model.fit(states, controls, deltas,
-                  iterations=max(40, config.model_epochs // 20),
+                  iterations=(config.gp_iterations
+                              or max(40, config.model_epochs // 20)),
                   init_from=previous)
         return model
     model = DynamicsEnsemble(d, du, members=config.members,
