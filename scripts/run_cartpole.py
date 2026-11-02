@@ -45,6 +45,7 @@ def main() -> int:
     ap.add_argument("--policy-blocks", type=int, default=2)
     ap.add_argument("--lbfgs-restarts", type=int, default=5)
     ap.add_argument("--particle-dropout", type=float, default=0.0)
+    ap.add_argument("--antithetic", action="store_true")
     ap.add_argument("--value-kind", default="particles",
                     choices=["particles", "unscented"])
     ap.add_argument("--variance-temperature", type=float, default=1.0)
@@ -77,6 +78,7 @@ def main() -> int:
                       policy_blocks=args.policy_blocks,
                       lbfgs_restarts=args.lbfgs_restarts,
                       particle_dropout=args.particle_dropout,
+                      antithetic=args.antithetic,
                       value_kind=args.value_kind,
                       variance_temperature=args.variance_temperature,
                       policy_rounds=args.policy_rounds,
