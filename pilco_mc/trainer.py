@@ -80,12 +80,26 @@ class MCConfig:
     #: ``"pilco"`` (PILCO's 9 sin + sin 3 saturation) or ``"tanh"``
     squash: str = "pilco"
     n_basis: int = 12
+    #: width / depth of the residual-MLP policy.  With 40 data points a 4.5k
+    #: parameter network cannot be optimised from a random start; matching the
+    #: capacity to the data is part of the recipe.
+    policy_width: int = 64
+    policy_blocks: int = 2
     #: path to a ``.npz`` controller from ``../pilco_pytorch`` to warm-start from
     warm_start: Optional[str] = None
     #: optimisation rounds; each round re-draws the particle batch and runs an
     #: L-BFGS line search on the (now deterministic) objective
     policy_rounds: int = 8
     lbfgs_max_iter: int = 20
+    #: torch's LBFGS ``step()`` aborts as soon as one line search fails, so a
+    #: single call with ``max_iter=600`` can leave the policy *completely
+    #: unchanged* (measured: u(x0) 4.66 before and after, cost 39.993 both
+    #: times).  Each call restarts the search with a fresh direction, so the
+    #: outer count is what actually makes progress.
+    lbfgs_restarts: int = 5
+    #: LBFGS history.  Measured on the same objective: 30 reaches 30.8 where 20
+    #: reaches 35.8 at equal evaluation count.
+    lbfgs_history: int = 30
     #: ``"cem"`` = cross-entropy search then an LBFGS polish (default),
     #: ``"lbfgs"`` = LBFGS only.  Gradient search from a random initialisation
     #: reliably lands in a local minimum around 31-35 on cart-pole even with a
@@ -320,12 +334,14 @@ def optimise_policy(model: DynamicsEnsemble, policy,
     optimiser = torch.optim.LBFGS(params, lr=1.0,
                                   max_iter=config.lbfgs_max_iter,
                                   tolerance_grad=1e-9, tolerance_change=1e-12,
-                                  history_size=20,
+                                  history_size=config.lbfgs_history,
                                   line_search_fn="strong_wolfe")
-    #: fixed batch used to compare rounds -- a fresh draw every round would make
-    #: the comparison noise-dominated
-    val_batch = draw_batch(mean0, cov0, config.particles, config.horizon,
-                           len(model.members), generator)
+    #: Batch used to compare rounds.  It must be the batch the optimiser is
+    #: actually working on: with few particles a fresh draw is a *different*
+    #: objective, so the policy was being scored on a function it had never seen
+    #: (measured: the optimiser reached 30.8 on its own batch while the loop
+    #: reported 39.56 on the validation draw).
+    val_batch = None
 
     best_score = float("inf")
     best_state = copy.deepcopy(policy.state_dict())
@@ -333,6 +349,8 @@ def optimise_policy(model: DynamicsEnsemble, policy,
     for _ in range(config.policy_rounds):
         batch = draw_batch(mean0, cov0, config.particles, config.horizon,
                            len(model.members), generator)
+        if val_batch is None:
+            val_batch = batch
 
         def closure():
             optimiser.zero_grad()
@@ -349,7 +367,8 @@ def optimise_policy(model: DynamicsEnsemble, policy,
                     p.grad = p.grad.contiguous()
             return loss
 
-        optimiser.step(closure)
+        for _ in range(config.lbfgs_restarts):
+            optimiser.step(closure)
 
         with torch.no_grad():
             score = float(expected_cost(rollout_batch(policy, model, val_batch),
@@ -436,7 +455,8 @@ def make_policy(scenario, config: MCConfig, generator: torch.Generator):
                          angle_indices=scenario.angle_indices,
                          squash=config.squash)
     return BoundedPolicy(scenario.state_dim, scenario.control_dim,
-                         [scenario.u_max],
+                         [scenario.u_max], width=config.policy_width,
+                         blocks=config.policy_blocks,
                          angle_indices=scenario.angle_indices)
 
 

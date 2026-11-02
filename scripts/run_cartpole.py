@@ -41,6 +41,9 @@ def main() -> int:
     ap.add_argument("--initial-rollouts", type=int, default=5)
     ap.add_argument("--initial-steps", type=int, default=100)
     ap.add_argument("--gp-iterations", type=int, default=0)
+    ap.add_argument("--policy-width", type=int, default=64)
+    ap.add_argument("--policy-blocks", type=int, default=2)
+    ap.add_argument("--lbfgs-restarts", type=int, default=5)
     ap.add_argument("--variance-temperature", type=float, default=1.0)
     ap.add_argument("--policy-rounds", type=int, default=8)
     ap.add_argument("--lbfgs-iter", type=int, default=20)
@@ -67,6 +70,9 @@ def main() -> int:
                       initial_rollouts=args.initial_rollouts,
                       initial_steps=args.initial_steps,
                       gp_iterations=args.gp_iterations,
+                      policy_width=args.policy_width,
+                      policy_blocks=args.policy_blocks,
+                      lbfgs_restarts=args.lbfgs_restarts,
                       variance_temperature=args.variance_temperature,
                       policy_rounds=args.policy_rounds,
                       lbfgs_max_iter=args.lbfgs_iter,
