@@ -134,6 +134,12 @@ class DynamicsEnsemble(nn.Module):
         self.register_buffer("u_sd", torch.ones(control_dim, dtype=DTYPE))
         self.register_buffer("y_mu", torch.zeros(state_dim, dtype=DTYPE))
         self.register_buffer("y_sd", torch.ones(state_dim, dtype=DTYPE))
+        #: standardised training inputs, kept so the model can tell how far a
+        #: query is from anything it has seen
+        self.register_buffer("train_z", torch.zeros(0, state_dim + control_dim,
+                                                    dtype=DTYPE))
+        #: weight of the distance-based epistemic variance (see ``epistemic``)
+        self.epistemic_scale = 0.0
 
     # -- normalisation ------------------------------------------------------
     def set_normalisation(self, states: torch.Tensor, controls: torch.Tensor,
@@ -144,10 +150,27 @@ class DynamicsEnsemble(nn.Module):
             self.x_mu, self.x_sd = stats(states)
             self.u_mu, self.u_sd = stats(controls)
             self.y_mu, self.y_sd = stats(deltas)
+            self.train_z = self._encode(states, controls).clone()
 
     def _encode(self, x: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
         return torch.cat([(x - self.x_mu) / self.x_sd,
                           (u - self.u_mu) / self.u_sd], dim=-1)
+
+    def epistemic(self, z: torch.Tensor) -> torch.Tensor:
+        """Squared distance to the nearest training input, times a scale.
+
+        This is the one thing a GP does that an ensemble of identically-trained
+        networks does not: its predictive variance **grows away from the data**
+        (measured: 0.0145 -> 0.0885 going from a training state to upright).  The
+        ensemble's does not (3.18 -> 2.60, it shrinks), because every member saw
+        the same points and they all extrapolate the same way.  Without a signal
+        like this the policy optimiser can walk into a region the model has never
+        seen and be told it is an improvement -- which is exactly what it does.
+        """
+        if self.epistemic_scale <= 0.0 or self.train_z.numel() == 0:
+            return torch.zeros(z.shape[:-1], dtype=z.dtype, device=z.device)
+        d2 = ((z[:, None, :] - self.train_z[None]) ** 2).sum(-1).min(dim=1).values
+        return self.epistemic_scale * d2
 
     # -- training -----------------------------------------------------------
     def nll(self, x: torch.Tensor, u: torch.Tensor, delta: torch.Tensor,
@@ -192,11 +215,12 @@ class DynamicsEnsemble(nn.Module):
             means.append(self.y_mu + self.y_sd * mean)
             variances.append((self.y_sd ** 2) * logvar.exp())
         mean = torch.stack(means).mean(0)
-        # total variance = E[aleatoric] + Var[epistemic mean]
+        # total variance = E[aleatoric] + Var(epistemic mean) + distance term
         aleatoric = torch.stack(variances).mean(0)
         epistemic = torch.stack(means).var(0) if len(models) > 1 \
             else torch.zeros_like(aleatoric)
-        return mean, aleatoric + epistemic
+        dist = self.epistemic(z).unsqueeze(-1)
+        return mean, aleatoric + epistemic + dist
 
     def step(self, x: torch.Tensor, u: torch.Tensor,
              generator: Optional[torch.Generator] = None,
@@ -228,7 +252,7 @@ class DynamicsEnsemble(nn.Module):
                 continue
             mk, logvk = m(z[sel])
             mean[sel] = self.y_mu + self.y_sd * mk
-            var[sel] = (self.y_sd ** 2) * logvk.exp()
+            var[sel] = (self.y_sd ** 2) * logvk.exp() + self.epistemic(z[sel]).unsqueeze(-1)
         var = var.clamp(min=1e-12)
         if noise is None:
             noise = torch.randn(mean.shape, dtype=x.dtype, generator=generator)

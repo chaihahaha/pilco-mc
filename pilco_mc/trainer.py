@@ -50,7 +50,11 @@ class MCConfig:
     members: int = 4
     hidden: int = 64
     blocks: int = 2
-    model_epochs: int = 600
+    #: the heteroscedastic variance head converges far more slowly than the
+    #: mean.  At 600 epochs the predicted sd is ~3.0 where the actual one-step
+    #: error is ~0.007, so every particle samples noise 300x the process noise;
+    #: at 3000 epochs it reaches ~0.32, which is the right order of magnitude.
+    model_epochs: int = 3000
     model_lr: float = 3e-3
     model_weight_decay: float = 1e-4
     validation_fraction: float = 0.15
