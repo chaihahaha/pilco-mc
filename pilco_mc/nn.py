@@ -142,6 +142,13 @@ class DynamicsEnsemble(nn.Module):
         self.register_buffer("epi_prior", torch.zeros(state_dim, dtype=DTYPE))
         self.register_buffer("epi_length", torch.ones(1, dtype=DTYPE))
         self.epistemic_scale = 0.0
+        #: temperature on the predictive variance.  The heteroscedastic head fits
+        #: the *average* squared error over the dataset, which is dominated by
+        #: the model's own misfit, so at any particular state it is far too wide
+        #: (measured: sd 0.305 where the GP says 0.0145 and the true error is
+        #: 0.0066).  Over-wide sampling diffuses the particle cloud until the
+        #: Monte Carlo cost saturates at "the pole has fallen" for every policy.
+        self.var_temperature = 1.0
 
     # -- normalisation ------------------------------------------------------
     def set_normalisation(self, states: torch.Tensor, controls: torch.Tensor,
@@ -247,7 +254,8 @@ class DynamicsEnsemble(nn.Module):
         aleatoric = torch.stack(variances).mean(0)
         epistemic = torch.stack(means).var(0) if len(models) > 1 \
             else torch.zeros_like(aleatoric)
-        return mean, aleatoric + epistemic + self.epistemic(z)
+        return mean, self.var_temperature * (aleatoric + epistemic
+                                             + self.epistemic(z))
 
     def step(self, x: torch.Tensor, u: torch.Tensor,
              generator: Optional[torch.Generator] = None,
@@ -279,7 +287,8 @@ class DynamicsEnsemble(nn.Module):
                 continue
             mk, logvk = m(z[sel])
             mean[sel] = self.y_mu + self.y_sd * mk
-            var[sel] = (self.y_sd ** 2) * logvk.exp() + self.epistemic(z[sel])
+            var[sel] = self.var_temperature * (
+                (self.y_sd ** 2) * logvk.exp() + self.epistemic(z[sel]))
         var = var.clamp(min=1e-12)
         if noise is None:
             noise = torch.randn(mean.shape, dtype=x.dtype, generator=generator)

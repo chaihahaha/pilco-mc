@@ -101,6 +101,12 @@ class MCConfig:
     gamma: float = 1.0
     #: stop the policy search early once the predicted cost is this low
     stop_cost: float = 0.0
+    #: temperature on the predictive variance (see ``DynamicsEnsemble``).  The
+    #: heteroscedastic head fits the average squared error, which is dominated by
+    #: model misfit, so it is wide enough to diffuse the particles until the
+    #: Monte Carlo cost saturates at "the pole has fallen" for every policy.
+    #: PILCO's GP reports sd 0.0145 in-data; the raw network reports 0.245.
+    variance_temperature: float = 0.02
     #: scale of the distance-based epistemic variance, ``alpha^2 * y_sd^2``
     #: saturating away from the data (0 disables it).  The target is a
     #: ``sd(off-data)/sd(in-data)`` ratio like a GP's (measured 6.1).
@@ -136,6 +142,7 @@ def fit_model(states: torch.Tensor, controls: torch.Tensor, deltas: torch.Tensor
     model.set_normalisation(states, controls, deltas)
     if config.epistemic_alpha > 0.0:
         model.set_epistemic(config.epistemic_alpha)
+    model.var_temperature = config.variance_temperature
 
     n = states.shape[0]
     n_val = int(config.validation_fraction * n) if n > 20 else 0
