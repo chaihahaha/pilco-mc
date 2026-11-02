@@ -90,6 +90,14 @@ class MCConfig:
     warm_start: Optional[str] = None
     #: optimisation rounds; each round re-draws the particle batch and runs an
     #: L-BFGS line search on the (now deterministic) objective
+    #: Particle dropout during the policy search: each evaluation keeps a random
+    #: subset of the particles, so the divergence of individual trajectories
+    #: cannot be fitted exactly.  This is MC-PILCO's own regulariser and it is the
+    #: MC-native answer to particles wandering off the data -- *not* moment
+    #: matching, which would defeat the purpose.  Rejected earlier because it made
+    #: the objective stochastic and the LBFGS closure stalled; that measurement
+    #: predates the sqrt(0) NaN fix, so it is retested here.
+    particle_dropout: float = 0.0
     policy_rounds: int = 8
     lbfgs_max_iter: int = 20
     #: torch's LBFGS ``step()`` aborts as soon as one line search fails, so a
