@@ -18,6 +18,7 @@ sees epistemic uncertainty rather than a single confident extrapolation) and
 from __future__ import annotations
 
 import copy
+import os
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -161,6 +162,8 @@ class MCConfig:
     #: goes stale, and the best achievable drops (13.28 -> 14.05).  The best
     #: controller is still returned at the end; this only controls the reset.
     keep_best: bool = False
+    #: refit ``var <- a * var^b`` on the data (see DynamicsEnsemble.calibrate)
+    calibrate_variance: bool = True
     #: scale of the distance-based epistemic variance, ``alpha^2 * y_sd^2``
     #: saturating away from the data (0 disables it).  The target is a
     #: ``sd(off-data)/sd(in-data)`` ratio like a GP's (measured 6.1).
@@ -207,6 +210,8 @@ def fit_model(states: torch.Tensor, controls: torch.Tensor, deltas: torch.Tensor
     if config.epistemic_alpha > 0.0:
         model.set_epistemic(config.epistemic_alpha)
     model.var_temperature = config.variance_temperature
+    if config.calibrate_variance:
+        model.calibrate(states, controls, deltas)
 
     n = states.shape[0]
     n_val = int(config.validation_fraction * n) if n > 20 else 0
@@ -362,6 +367,9 @@ def optimise_policy(model: DynamicsEnsemble, policy,
             loss = expected_cost(roll, cost_fn, config.gamma, 0.0,
                                  None, config.uncertainty_weight)
             loss.backward()
+            if os.environ.get("PILCO_MC_DEBUG"):
+                print(f"      closure: loss={float(loss):.4f} "
+                      f"|g|={sum(float(p.grad.norm()) for p in params if p.grad is not None):.3e}")
             for p in params:
                 if p.grad is not None and not p.grad.is_contiguous():
                     p.grad = p.grad.contiguous()

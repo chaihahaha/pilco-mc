@@ -73,9 +73,17 @@ def expected_cost(roll: Rollout, cost_fn: Callable[[torch.Tensor], torch.Tensor]
     cost = cost_fn(states)                                      # (H, P)
     weights = discount_weights(cost.shape[0], gamma, cost.dtype, cost.device)
     if uncertainty_weight > 0.0 and roll.variances is not None:
-        # norm of the per-step predictive standard deviation, averaged over
-        # particles; ``variances`` is (H, P, D)
-        sd_norm = roll.variances.clamp(min=0.0).sum(-1).sqrt()  # (H, P)
+        # Norm of the per-step predictive standard deviation, averaged over
+        # particles; ``variances`` is (H, P, D).
+        #
+        # The epsilon inside the sqrt is not cosmetic.  ``sqrt(0)`` has an
+        # infinite derivative, so when the variance is zero (a deterministic
+        # rollout, i.e. ``variance_temperature=0``) multiplying by it produces
+        # **NaN gradients** and every optimiser step silently fails.  Measured:
+        # the first closure call had loss 39.9971 with |grad| = nan, after which
+        # the policy never changed -- which invalidated every closed-loop run
+        # that used the default uncertainty weight.
+        sd_norm = torch.sqrt(roll.variances.clamp(min=0.0).sum(-1) + 1e-12)
         cost = cost + uncertainty_weight * sd_norm
     per_particle = (cost * weights[:, None]).sum(0)             # (P,)
     per_particle = particle_dropout(per_particle, dropout, generator)

@@ -149,6 +149,12 @@ class DynamicsEnsemble(nn.Module):
         #: 0.0066).  Over-wide sampling diffuses the particle cloud until the
         #: Monte Carlo cost saturates at "the pole has fallen" for every policy.
         self.var_temperature = 1.0
+        #: per-state variance recalibration ``var <- a * var^b``, fitted on held-out
+        #: data by :meth:`calibrate`.  A single global temperature cannot fix a
+        #: variance whose *shape* is wrong: too wide on the data (so every policy
+        #: looks equally bad and the optimiser stops) and not wide enough off it.
+        self.cal_a = 1.0
+        self.cal_b = 1.0
 
     # -- normalisation ------------------------------------------------------
     def set_normalisation(self, states: torch.Tensor, controls: torch.Tensor,
@@ -188,6 +194,29 @@ class DynamicsEnsemble(nn.Module):
                 nn2, quantile).clamp(min=1e-8)).reshape(1)
             self.epi_prior = (alpha ** 2) * (self.y_sd ** 2)
         self.epistemic_scale = 1.0
+
+    def calibrate(self, states: torch.Tensor, controls: torch.Tensor,
+                  deltas: torch.Tensor) -> None:
+        """Fit ``var <- a * var^b`` by maximising the held-out Gaussian likelihood.
+
+        The heteroscedastic head is trained to fit the *average* squared error, so
+        its variance is the wrong size at any particular state.  A power law is
+        the smallest correction that can also change the *shape* of the variance
+        across states, which is what matters: the planner needs "narrow where the
+        model is good, wide where it is not".
+        """
+        with torch.no_grad():
+            mean, var = self.predict(states, controls)
+            err2 = ((deltas - mean) ** 2).mean(-1)          # (n,) over dims
+            v = var.mean(-1).clamp(min=1e-12)
+            best = (float("inf"), 1.0, 1.0)
+            for b in (0.25, 0.5, 0.75, 1.0, 1.5, 2.0):
+                vb = v ** b
+                a = float((err2 / vb).mean())
+                nll = float((torch.log(a * vb) + err2 / (a * vb)).mean())
+                if nll < best[0]:
+                    best = (nll, a, b)
+        self.cal_a, self.cal_b = best[1], best[2]
 
     def epistemic(self, z: torch.Tensor) -> torch.Tensor:
         """Saturating distance-based epistemic variance (see :meth:`set_epistemic`).
@@ -254,8 +283,10 @@ class DynamicsEnsemble(nn.Module):
         aleatoric = torch.stack(variances).mean(0)
         epistemic = torch.stack(means).var(0) if len(models) > 1 \
             else torch.zeros_like(aleatoric)
-        return mean, self.var_temperature * (aleatoric + epistemic
-                                             + self.epistemic(z))
+        var = self.var_temperature * (aleatoric + epistemic + self.epistemic(z))
+        if self.cal_b != 1.0 or self.cal_a != 1.0:
+            var = self.cal_a * var.clamp(min=1e-12) ** self.cal_b
+        return mean, var
 
     def step(self, x: torch.Tensor, u: torch.Tensor,
              generator: Optional[torch.Generator] = None,
@@ -289,6 +320,8 @@ class DynamicsEnsemble(nn.Module):
             mean[sel] = self.y_mu + self.y_sd * mk
             var[sel] = self.var_temperature * (
                 (self.y_sd ** 2) * logvk.exp() + self.epistemic(z[sel]))
+            if self.cal_b != 1.0 or self.cal_a != 1.0:
+                var[sel] = self.cal_a * var[sel].clamp(min=1e-12) ** self.cal_b
         var = var.clamp(min=1e-12)
         if noise is None:
             noise = torch.randn(mean.shape, dtype=x.dtype, generator=generator)
