@@ -138,7 +138,9 @@ class DynamicsEnsemble(nn.Module):
         #: query is from anything it has seen
         self.register_buffer("train_z", torch.zeros(0, state_dim + control_dim,
                                                     dtype=DTYPE))
-        #: weight of the distance-based epistemic variance (see ``epistemic``)
+        #: saturating distance-based epistemic variance (see ``epistemic``)
+        self.register_buffer("epi_prior", torch.zeros(state_dim, dtype=DTYPE))
+        self.register_buffer("epi_length", torch.ones(1, dtype=DTYPE))
         self.epistemic_scale = 0.0
 
     # -- normalisation ------------------------------------------------------
@@ -156,21 +158,47 @@ class DynamicsEnsemble(nn.Module):
         return torch.cat([(x - self.x_mu) / self.x_sd,
                           (u - self.u_mu) / self.u_sd], dim=-1)
 
+    def set_epistemic(self, alpha: float = 1.0, quantile: float = 0.5) -> None:
+        """Configure the distance-based epistemic variance.
+
+        ``epi(z) = epi_prior * (1 - exp(-d^2 / (2 ell^2)))`` where ``d`` is the
+        distance (in standardised inputs) to the nearest training point.  It is 0
+        on the data and saturates at ``epi_prior`` far away -- the shape a GP's
+        predictive variance has, and the shape the ensemble's lack of agreement
+        does *not* have.
+
+        ``epi_prior`` is ``alpha^2 * y_sd^2`` (the GP's ``sf^2`` prior in PILCO's
+        parameterisation) and ``ell`` is the ``quantile`` of the distance to the
+        nearest neighbour, so "far" is measured in units of the data spacing.
+        """
+        if self.train_z.numel() == 0:
+            return
+        with torch.no_grad():
+            d2 = ((self.train_z[:, None, :] - self.train_z[None]) ** 2).sum(-1)
+            d2.diagonal().fill_(float("inf"))
+            nn2 = d2.min(dim=1).values
+            self.epi_length = torch.sqrt(torch.quantile(
+                nn2, quantile).clamp(min=1e-8)).reshape(1)
+            self.epi_prior = (alpha ** 2) * (self.y_sd ** 2)
+        self.epistemic_scale = 1.0
+
     def epistemic(self, z: torch.Tensor) -> torch.Tensor:
-        """Squared distance to the nearest training input, times a scale.
+        """Saturating distance-based epistemic variance (see :meth:`set_epistemic`).
 
         This is the one thing a GP does that an ensemble of identically-trained
         networks does not: its predictive variance **grows away from the data**
-        (measured: 0.0145 -> 0.0885 going from a training state to upright).  The
-        ensemble's does not (3.18 -> 2.60, it shrinks), because every member saw
-        the same points and they all extrapolate the same way.  Without a signal
-        like this the policy optimiser can walk into a region the model has never
-        seen and be told it is an improvement -- which is exactly what it does.
+        (measured on the same states: GP 0.0145 -> 0.0885 going from a training
+        state to upright).  The ensemble's does not (3.18 -> 2.60, it shrinks),
+        because every member saw the same points and they all extrapolate the
+        same way.  Without a signal like this the policy optimiser can walk into
+        a region the model has never seen and be told it is an improvement.
         """
         if self.epistemic_scale <= 0.0 or self.train_z.numel() == 0:
-            return torch.zeros(z.shape[:-1], dtype=z.dtype, device=z.device)
+            return torch.zeros(z.shape[:-1] + (self.state_dim,),
+                               dtype=z.dtype, device=z.device)
         d2 = ((z[:, None, :] - self.train_z[None]) ** 2).sum(-1).min(dim=1).values
-        return self.epistemic_scale * d2
+        gate = 1.0 - torch.exp(-0.5 * d2 / (self.epi_length ** 2))
+        return gate[:, None] * self.epi_prior[None, :]
 
     # -- training -----------------------------------------------------------
     def nll(self, x: torch.Tensor, u: torch.Tensor, delta: torch.Tensor,
@@ -219,8 +247,7 @@ class DynamicsEnsemble(nn.Module):
         aleatoric = torch.stack(variances).mean(0)
         epistemic = torch.stack(means).var(0) if len(models) > 1 \
             else torch.zeros_like(aleatoric)
-        dist = self.epistemic(z).unsqueeze(-1)
-        return mean, aleatoric + epistemic + dist
+        return mean, aleatoric + epistemic + self.epistemic(z)
 
     def step(self, x: torch.Tensor, u: torch.Tensor,
              generator: Optional[torch.Generator] = None,
@@ -252,7 +279,7 @@ class DynamicsEnsemble(nn.Module):
                 continue
             mk, logvk = m(z[sel])
             mean[sel] = self.y_mu + self.y_sd * mk
-            var[sel] = (self.y_sd ** 2) * logvk.exp() + self.epistemic(z[sel]).unsqueeze(-1)
+            var[sel] = (self.y_sd ** 2) * logvk.exp() + self.epistemic(z[sel])
         var = var.clamp(min=1e-12)
         if noise is None:
             noise = torch.randn(mean.shape, dtype=x.dtype, generator=generator)

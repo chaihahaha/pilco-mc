@@ -54,10 +54,16 @@ class MCConfig:
     #: mean.  At 600 epochs the predicted sd is ~3.0 where the actual one-step
     #: error is ~0.007, so every particle samples noise 300x the process noise;
     #: at 3000 epochs it reaches ~0.32, which is the right order of magnitude.
-    model_epochs: int = 3000
+    model_epochs: int = 1500
     model_lr: float = 3e-3
-    model_weight_decay: float = 1e-4
-    validation_fraction: float = 0.15
+    #: weight decay is off: applied to the log-variance head it pulls the
+    #: predictive variance back to 1 (in normalised units), i.e. ~300x the true
+    #: process noise, which is what made every particle sample garbage.
+    model_weight_decay: float = 0.0
+    #: early stopping is off by default: the variance head converges long after
+    #: the validation loss plateaus, and stopping there leaves the model
+    #: sampling noise ~300x the process noise (see docs/NOTES.md)
+    validation_fraction: float = 0.0
 
     # -- policy -----------------------------------------------------------
     #: ``"rbf"`` (PILCO's controller, few parameters) or ``"mlp"``
@@ -95,6 +101,10 @@ class MCConfig:
     gamma: float = 1.0
     #: stop the policy search early once the predicted cost is this low
     stop_cost: float = 0.0
+    #: scale of the distance-based epistemic variance, ``alpha^2 * y_sd^2``
+    #: saturating away from the data (0 disables it).  The target is a
+    #: ``sd(off-data)/sd(in-data)`` ratio like a GP's (measured 6.1).
+    epistemic_alpha: float = 0.0
 
     verbose: bool = True
 
@@ -124,9 +134,11 @@ def fit_model(states: torch.Tensor, controls: torch.Tensor, deltas: torch.Tensor
     model = DynamicsEnsemble(d, du, members=config.members,
                              hidden=config.hidden, blocks=config.blocks)
     model.set_normalisation(states, controls, deltas)
+    if config.epistemic_alpha > 0.0:
+        model.set_epistemic(config.epistemic_alpha)
 
     n = states.shape[0]
-    n_val = max(1, int(config.validation_fraction * n)) if n > 20 else 0
+    n_val = int(config.validation_fraction * n) if n > 20 else 0
     perm = torch.randperm(n, generator=torch.Generator().manual_seed(seed))
     val, train = perm[:n_val], perm[n_val:]
 

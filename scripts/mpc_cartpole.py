@@ -89,37 +89,24 @@ def plan_and_act(model, cost_fn, state: torch.Tensor, plan_horizon: int,
 @torch.no_grad()
 def run_mpc(model, scenario, x0: np.ndarray, steps: int, plan_horizon: int,
             rng: np.random.Generator, with_noise: bool = True,
-            iters: int = 60,
-            terminal_weight: float = 4.0) -> tuple[np.ndarray, list[float]]:
+            iters: int = 60, terminal_weight: float = 4.0):
     x = np.asarray(x0, dtype=np.float64).copy()
     if with_noise:
         x = x + rng.standard_normal(4) * scenario.process_noise
     previous = torch.zeros(plan_horizon)
-    states, costs = [x.copy()], []
+    states, costs, applied = [x.copy()], [], []
     for _ in range(steps):
         costs.append(float(scenario.cost(torch.as_tensor(x))))
         u, previous = plan_and_act(model, scenario.cost,
                                    torch.as_tensor(x)[None], plan_horizon,
                                    scenario.u_max, scenario.dt, previous, iters,
                                    terminal_weight)
+        applied.append(u)
         x = scenario.step_true(x, u)
         if with_noise:
             x = x + rng.standard_normal(4) * scenario.process_noise
         states.append(x.copy())
-    return np.asarray(states), costs
-
-
-def _controls_from_states(scenario, model, states, plan_horizon, rng):
-    """Replay MPC to recover the controls it applied (for the dataset)."""
-    previous = torch.zeros(plan_horizon)
-    out = []
-    for t in range(len(states) - 1):
-        u, previous = plan_and_act(model, scenario.cost,
-                                   torch.as_tensor(states[t])[None],
-                                   plan_horizon, scenario.u_max, scenario.dt,
-                                   previous, 60)
-        out.append(u)
-    return out
+    return np.asarray(states), costs, np.asarray(applied)
 
 
 def main() -> int:
@@ -149,15 +136,14 @@ def main() -> int:
     print("  episode   realised cost   (open-loop policy search was ~39.9)")
     for episode in range(args.episodes):
         x0 = mean0.numpy() + np.linalg.cholesky(cov0.numpy()) @ rng.standard_normal(4)
-        states_mpc, costs = run_mpc(model, scenario, x0, args.horizon,
-                                    args.plan_horizon, rng, iters=args.iters,
-                                    terminal_weight=args.terminal_weight)
+        states_mpc, costs, applied = run_mpc(model, scenario, x0, args.horizon,
+                                             args.plan_horizon, rng,
+                                             iters=args.iters,
+                                             terminal_weight=args.terminal_weight)
         print(f"  {episode + 1:7d}   {np.sum(costs):13.2f}")
         # add the closed-loop trajectory to the data and re-fit: the model then
         # covers the states MPC actually visits, which is the region that matters
-        us = np.asarray(_controls_from_states(scenario, model, states_mpc,
-                                              args.plan_horizon, rng))[:args.horizon]
-        i, j, k = scenario.transitions(states_mpc, us)
+        i, j, k = scenario.transitions(states_mpc, applied)
         states.append(i); controls.append(j); deltas.append(k)
         model = fit_model(torch.cat(states), torch.cat(controls),
                           torch.cat(deltas), config, seed=args.seed + episode)
