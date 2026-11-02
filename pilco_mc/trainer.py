@@ -145,12 +145,6 @@ class MCConfig:
     #: sampled cost is exactly constant (every particle pays 0.99966 per step),
     #: so the gradient is exactly zero and no optimiser can move.
     initial_control_fraction: float = 0.5
-    #: Warm-start the GP hyper-parameters from the previous episode.  **Measured
-    #: to hurt**: the model then stays in its initial basin and never adapts to
-    #: the swing-up data the loop starts collecting, so the predicted cost sticks
-    #: at 38 and the good policy is lost (25.3 -> 39.99 for five episodes, against
-    #: 25.3 40.0 14.9 13.3 ... with a cold refit).  Kept as an option.
-    warm_start_model: bool = False
     #: Report and decide on **separate** rollouts from the one used for data.
     #: With this on, each episode runs three rollouts on the plant: one for the
     #: dataset, one for the accept/reject decision, one for the reported number.
@@ -167,11 +161,6 @@ class MCConfig:
     #: ``theta = (1 - blend) * theta_prev + blend * theta_new``.  1.0 disables the
     #: trust region and lets the optimiser jump wherever it likes.
     policy_blend: float = 0.5
-    #: Restore the best controller before each episode.  **Measured to hurt**:
-    #: resetting every episode stops the loop from exploring, the model's data
-    #: goes stale, and the best achievable drops (13.28 -> 14.05).  The best
-    #: controller is still returned at the end; this only controls the reset.
-    keep_best: bool = False
     #: How the expected cost is estimated for the policy search:
     #: ``"particles"`` -- Monte Carlo; ``"unscented"`` -- sigma-point moment
     #: propagation, which reproduces PILCO's objective for *any* model.
@@ -558,18 +547,11 @@ def learn(scenario, config: Optional[MCConfig] = None,
     logs: list[EpisodeLog] = []
     model = None
     for episode in range(config.episodes):
-        if episode > 0 and config.keep_best:
-            # Start every episode from the best controller measured so far, not
-            # from last episode's iterate.  Without this, an episode whose
-            # optimisation goes to a worse local optimum (measured: 13.28 ->
-            # 25.49) drags the whole loop down with it.
-            policy.load_state_dict(best_policy_state)
         states = torch.cat(states_all)
         controls = torch.cat(controls_all)
         deltas = torch.cat(deltas_all)
         model = fit_model(states, controls, deltas, config,
-                          seed=config.seed + episode,
-                          previous=model if config.warm_start_model else None)
+                          seed=config.seed + episode)
         before = copy.deepcopy(policy.state_dict())
         predicted, stderr = optimise_policy(model, policy, scenario.cost,
                                             mean0, cov0, config, generator)
