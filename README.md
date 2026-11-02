@@ -11,9 +11,11 @@ because every stage is an ARD squared-exponential kernel.  Once the moments are
 estimated from samples, nothing has to be integrable, so the model and the
 controller can be arbitrary differentiable functions.
 
-**Status: the estimator is validated and the machinery is correct (a
-known-good controller scores 13.4 in this package's own rollout), but the loop
-still does not learn the swing-up.**  Two rounds of "fix what is broken" closed
+**Status: a neural policy (residual MLP) now drives the cart-pole swing-up in
+the closed loop, at a cost of 13.3 against PILCO's 12.8 -- but only when
+warm-started by distilling PILCO's controller, and the loop oscillates between 13
+and 25-40 rather than settling.  The neural *dynamics* model does not work even
+then.**  Two rounds of "fix what is broken" closed
 five real defects — best single-optimisation result went from 40 to 27 — yet the
 closed loop still sits at ~39.  The remaining gap is the policy-search landscape,
 not the estimator and not the model class.  Details and the next three steps are

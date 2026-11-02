@@ -366,6 +366,11 @@ def load_policy_npz(policy, path: str) -> None:
     ``lengthscales``, ``beta``), so this is an exact transfer when
     ``squash="pilco"``.
     """
+    if path.endswith(".pt"):
+        # a distilled network policy, saved as a plain state_dict
+        with torch.no_grad():
+            policy.load_state_dict(torch.load(path))
+        return
     data = np.load(path)
     centers = np.asarray(data["centers"])
     ell = np.asarray(data["lengthscales"])
