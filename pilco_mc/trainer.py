@@ -170,6 +170,10 @@ class MCConfig:
     #: goes stale, and the best achievable drops (13.28 -> 14.05).  The best
     #: controller is still returned at the end; this only controls the reset.
     keep_best: bool = False
+    #: How the expected cost is estimated for the policy search:
+    #: ``"particles"`` -- Monte Carlo; ``"unscented"`` -- sigma-point moment
+    #: propagation, which reproduces PILCO's objective for *any* model.
+    value_kind: str = "particles"
     #: refit ``var <- a * var^b`` on the data (see DynamicsEnsemble.calibrate)
     calibrate_variance: bool = True
     #: scale of the distance-based epistemic variance, ``alpha^2 * y_sd^2``
@@ -367,6 +371,15 @@ def optimise_policy(model: DynamicsEnsemble, policy,
 
         def closure():
             optimiser.zero_grad()
+            if config.value_kind == "unscented":
+                from .unscented import unscented_value
+                loss = unscented_value(model, policy, mean0, cov0,
+                                       config.horizon, cost_fn)
+                loss.backward()
+                for p in params:
+                    if p.grad is not None and not p.grad.is_contiguous():
+                        p.grad = p.grad.contiguous()
+                return loss
             roll = rollout_batch(policy, model, batch)
             # No dropout here: a fresh dropout mask per evaluation would make the
             # objective random again, which is exactly what the fixed batch is

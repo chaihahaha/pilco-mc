@@ -393,6 +393,19 @@ class RbfPolicy(nn.Module):
                                                        dtype=DTYPE, generator=generator))
         self.register_buffer("u_max", torch.as_tensor(list(u_max), dtype=DTYPE))
 
+    def on_augmented(self, h: torch.Tensor) -> torch.Tensor:
+        """Control from an **already augmented** input ``[x, trig]``.
+
+        The unscented propagation assembles that layout itself, so it must not
+        augment a second time.
+        """
+        inv_ell2 = torch.exp(-2.0 * self.log_lengthscales)
+        d2 = ((h[:, None, :] - self.centers[None]) ** 2 * inv_ell2).sum(-1)
+        raw = torch.exp(-0.5 * d2) @ self.weights
+        if self.squash == "pilco":
+            return self.u_max * (9.0 * torch.sin(raw) + torch.sin(3.0 * raw)) / 8.0
+        return self.u_max * torch.tanh(raw)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = _augment(x, self.angle_indices)
         inv_ell2 = torch.exp(-2.0 * self.log_lengthscales)      # 1 / ell^2
@@ -431,6 +444,10 @@ class BoundedPolicy(nn.Module):
         # dependence is learned from there.
         with torch.no_grad():
             self.net.out.bias.fill_(float(torch.atanh(torch.tensor(0.3))))
+
+    def on_augmented(self, h: torch.Tensor) -> torch.Tensor:
+        """Control from an already augmented input (see RbfPolicy)."""
+        return self.u_max * torch.tanh(self.net(h))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.u_max * torch.tanh(self.net(_augment(x, self.angle_indices)))
