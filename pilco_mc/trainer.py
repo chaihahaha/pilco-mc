@@ -46,7 +46,12 @@ class MCConfig:
     initial_steps: int = 100
     seed: int = 0
 
-    # -- dynamics ensemble ------------------------------------------------
+    # -- dynamics model ----------------------------------------------------
+    #: ``"nn"`` = bootstrapped residual-MLP ensemble; ``"gp"`` = one exact GP per
+    #: state dimension (PILCO's model).  The network's variance is fitted to the
+    #: average squared error and comes out 20x too wide; a GP's posterior
+    #: variance is narrow on the data and wide off it.
+    model_kind: str = "gp"
     members: int = 4
     hidden: int = 64
     blocks: int = 2
@@ -137,6 +142,12 @@ def fit_model(states: torch.Tensor, controls: torch.Tensor, deltas: torch.Tensor
     the extrapolation.
     """
     d, du = states.shape[1], controls.shape[1]
+    if config.model_kind == "gp":
+        from .gp import GpDynamics
+        model = GpDynamics(d, du)
+        model.var_temperature = config.variance_temperature
+        return model.fit(states, controls, deltas,
+                         iterations=max(40, config.model_epochs // 20))
     model = DynamicsEnsemble(d, du, members=config.members,
                              hidden=config.hidden, blocks=config.blocks)
     model.set_normalisation(states, controls, deltas)

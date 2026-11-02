@@ -36,6 +36,10 @@ def main() -> int:
     ap.add_argument("--dropout", type=float, default=0.1)
     ap.add_argument("--warm-start", default=None,
                     help="path to a pilco_pytorch controller .npz to start from")
+    ap.add_argument("--model-kind", default="gp", choices=["gp", "nn"])
+    ap.add_argument("--variance-temperature", type=float, default=1.0)
+    ap.add_argument("--policy-rounds", type=int, default=8)
+    ap.add_argument("--lbfgs-iter", type=int, default=20)
     ap.add_argument("--policy-optimizer", default="cem",
                     choices=["cem", "lbfgs"])
     ap.add_argument("--smoke", action="store_true",
@@ -54,6 +58,10 @@ def main() -> int:
                       model_epochs=args.model_epochs,
                       members=args.members, dropout=args.dropout,
                       warm_start=args.warm_start,
+                      model_kind=args.model_kind,
+                      variance_temperature=args.variance_temperature,
+                      policy_rounds=args.policy_rounds,
+                      lbfgs_max_iter=args.lbfgs_iter,
                       policy_optimizer=args.policy_optimizer,
                       verbose=True)
     t0 = time.time()
