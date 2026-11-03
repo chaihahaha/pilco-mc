@@ -169,8 +169,15 @@ class MCConfig:
     #: ``"particles"`` -- Monte Carlo; ``"unscented"`` -- sigma-point moment
     #: propagation, which reproduces PILCO's objective for *any* model.
     value_kind: str = "particles"
-    #: refit ``var <- a * var^b`` on the data (see DynamicsEnsemble.calibrate)
-    calibrate_variance: bool = True
+    #: Refit ``var <- a * var^b`` on the data (see DynamicsEnsemble.calibrate).
+    #: **Off by default, and it was the cause of the episode-to-episode
+    #: oscillation**: fitted in-sample on a handful of points, the exponent jumps
+    #: between refits -- measured cal_b = 1.00, 2.00, 0.25 on consecutive episodes.
+    #: That rescales the particle diffusion by orders of magnitude each episode, so
+    #: the imagined cost swings (27.8 -> 36.2 -> 27.5) even though nothing else
+    #: changed.  PILCO has no such step: its GP variance is exact.  Kept as an
+    #: option, off by default.
+    calibrate_variance: bool = False
     #: scale of the distance-based epistemic variance, ``alpha^2 * y_sd^2``
     #: saturating away from the data (0 disables it).  The target is a
     #: ``sd(off-data)/sd(in-data)`` ratio like a GP's (measured 6.1).
@@ -220,6 +227,9 @@ def fit_model(states: torch.Tensor, controls: torch.Tensor, deltas: torch.Tensor
     model.var_temperature = config.variance_temperature
     if config.calibrate_variance:
         model.calibrate(states, controls, deltas)
+    if os.environ.get("PILCO_MC_DEBUG"):
+        print(f"      model: n={states.shape[0]:4d} cal_a={model.cal_a:.4g} "
+              f"cal_b={model.cal_b:.2f}", flush=True)
 
     n = states.shape[0]
     n_val = int(config.validation_fraction * n) if n > 20 else 0
@@ -535,9 +545,6 @@ def learn(scenario, config: Optional[MCConfig] = None,
     if not config.warm_start:
         initialise_output_scale(policy, mean0[None],
                                 target=config.initial_control_fraction)
-    best_policy_state = copy.deepcopy(policy.state_dict())
-    best_reported = float("inf")
-    best_decision = float("inf")
     if config.warm_start:
         load_policy_npz(policy, config.warm_start)
         if log is not None and config.verbose:
@@ -581,13 +588,10 @@ def learn(scenario, config: Optional[MCConfig] = None,
         else:
             decision_cost = reported = realised
 
-        if decision_cost < best_decision:
-            best_decision = decision_cost
-            best_reported = reported
-            best_policy_state = copy.deepcopy(policy.state_dict())
-        elif config.accept_by_rollout:
-            # not better on the plant: keep the data, drop the controller
-            policy.load_state_dict(best_policy_state)
+        # No selection of any kind: the policy that is returned is the one the
+        # loop ended with.  Keeping the best controller seen -- by validation, by
+        # test rollout, whatever -- is cherry-picking and hides oscillation
+        # instead of fixing it.
         logs.append(EpisodeLog(episode, reported, predicted, stderr,
                                int(states.shape[0])))
         if log is not None and config.verbose:
@@ -595,7 +599,6 @@ def learn(scenario, config: Optional[MCConfig] = None,
                 f"data={states.shape[0]:4d}  "
                 f"predicted {predicted:7.2f} +- {stderr:5.2f}  "
                 f"realised {reported:7.2f}")
-    policy.load_state_dict(best_policy_state)
     if log is not None and config.verbose:
-        log(f"  best-by-validation controller: test cost {best_reported:.2f}")
+        log(f"  final controller: test cost {reported:.2f}")
     return policy, model, logs
