@@ -11,19 +11,38 @@ because every stage is an ARD squared-exponential kernel.  Once the moments are
 estimated from samples, nothing has to be integrable, so the model and the
 controller can be arbitrary differentiable functions.
 
-**Status: holds PILCO's level when distilled; learns to ~27 from scratch; and the
-network's real advantage is scaling, not accuracy — at 3000 points one planning
-step costs 8.5 s with a GP and 12 ms with the network (730x), and only the network
-keeps improving with more data.**  A residual-MLP policy inside the particle
-loop holds a realised cost of **12.84-13.01 across six episodes** against PILCO's
-12.8, measured on held-out test rollouts (validation and test are separate from
-the training rollout).  From scratch, without distillation, the loop learns from
-**39.3 to 26.4** over eight episodes, also under the honest protocol.  Two
-caveats: it needs a **distilled** initialisation (the swing-up is not discovered
-from scratch), and the neural *dynamics* model still does not work -- these runs
-use a GP.  The three defects that had to be fixed first (variance calibration,
-the exact-saturation plateau, and the per-episode oscillation) are documented in
-[docs/NOTES.md](docs/NOTES.md).  Two rounds of "fix what is broken" closed
+**Status: the diagnostic is complete; the algorithm is not yet competitive.**
+
+What the Monte Carlo objective can and cannot do at a small data budget, all
+measured (see [docs/NOTES.md](docs/NOTES.md) for the ten experiments):
+
+* it has **global structure** -- along the line from a random policy to a verified
+  good one it separates them by 1.1 at 40 points and 16.6 at 2560, with a
+  signal-to-noise ratio of 17 to 515;
+* it has **no local gradient** -- along the analytic-gradient direction it spans
+  0.015, the same size as its own seed-to-seed noise, while analytic moment
+  matching manufactures a 0.54-deep basin there.
+
+So a gradient search stalls at ~39 and a population search can exploit the
+structure but needs a large budget.  Realised cost per episode, swing-up:
+
+| method | cost |
+| --- | --- |
+| PILCO (analytic moments) | 37.9, 28.0, **14.5**, 14.0 |
+| neural net + MC, LBFGS | 39.99 x 6 |
+| neural net + MC, CEM 48x30 | 38.8, 35.7, 38.0, 33.6, 38.6, 36.6 |
+| neural net + MC, CEM 256x100 | 38.59, 35.19, 31.67, **26.46**, 34.74, 34.36, 27.55, 29.07 |
+
+Over eight episodes that configuration improves from 38.6 to a best of 26.5 and then
+oscillates between 27 and 35 -- the model itself jumps from one refit to the next
+(the imagined cost swings 27.8 -> 36.2 -> 27.5), which is the instability the
+earlier sections describe.  PILCO reaches 14.5 by episode 3.
+
+Monte Carlo with neural networks is not a wrong route, but at PILCO's data budget
+it costs far more policy-search budget for a worse and unstable result. The reusable products
+here are the pluggable implementation and the measurements, not a headline number.
+
+See [docs/NOTES.md](docs/NOTES.md)..  Two rounds of "fix what is broken" closed
 five real defects — best single-optimisation result went from 40 to 27 — yet the
 closed loop still sits at ~39.  The remaining gap is the policy-search landscape,
 not the estimator and not the model class.  Details and the next three steps are
